@@ -12,13 +12,14 @@ Pine behavior on weekly chart:
 """
 
 import os
+import re
 import json
 import smtplib
 import urllib.request
 import urllib.parse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # --- CONFIG (matches Pine input.* defaults) ---
 CONFIG = {
@@ -70,38 +71,45 @@ def fetch_yahoo(symbol, days=None, weeks=None, interval="1d"):
         return []
 
 
-def fetch_cboe_cpc_daily(num_days=100):
-    """Fetch CBOE total put/call ratio CSV, return daily values."""
-    url = "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/totalpc.csv"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+def fetch_cpc_from_ycharts(num_values=10):
+    """Scrape latest daily CPC values from ycharts historical data table."""
+    url = "https://ycharts.com/indicators/total_putcall_ratio"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            csv_text = resp.read().decode("utf-8", errors="ignore")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
     except Exception as e:
-        print(f"CBOE fetch error: {e}")
+        print(f"ycharts fetch error: {e}")
         return []
 
-    lines = csv_text.strip().split("\n")
-    start_idx = 0
-    for i, line in enumerate(lines):
-        if "DATE" in line.upper() and "P/C" in line.upper():
-            start_idx = i + 1
-            break
-
-    daily = []
-    for line in lines[start_idx:]:
-        cols = line.strip().split(",")
-        if len(cols) < 5:
-            continue
+    # Extract values from the historical data tables
+    # Pattern: table rows with date and value like "March 11, 2026 | 1.05"
+    values = []
+    rows = re.findall(
+        r'<tr[^>]*>\s*<td[^>]*>([A-Za-z]+ \d{1,2}, \d{4})</td>\s*<td[^>]*>([\d.]+)</td>\s*</tr>',
+        html
+    )
+    for date_str, val_str in rows:
         try:
-            ratio = float(cols[4])
-            parts = cols[0].split("/")
-            dt = datetime(int(parts[2]), int(parts[0]), int(parts[1]))
-            daily.append(ratio)
-        except (ValueError, IndexError):
+            val = float(val_str)
+            values.append(val)
+        except ValueError:
             continue
 
-    return daily[-num_days:]
+    if not values:
+        print("WARNING: Could not parse CPC data from ycharts. Trying fallback pattern...")
+        # Fallback: look for any float values in table cells after date patterns
+        values = [float(v) for v in re.findall(r'(?:20[0-9]{2})\s*</td>\s*<td[^>]*>\s*([\d.]+)', html)]
+
+    if values:
+        print(f"Scraped {len(values)} CPC values from ycharts (latest: {values[0]})")
+        # Values are in reverse chronological order on the page, take first num_values
+        return values[:num_values]
+    else:
+        print("ERROR: Failed to scrape CPC from ycharts.")
+        return []
 
 
 # --- INDICATORS ---
@@ -144,10 +152,12 @@ def run():
     # WEEKLY candles for price, RSI, 200-week MA (need 220+ weeks for warmup)
     ticker_weekly = fetch_yahoo(CONFIG["TICKER"], weeks=250, interval="1wk")
 
-    # DAILY data for VIX, CPC, breadth (matching Pine's request.security("...", "D", close))
+    # DAILY data for VIX, breadth (matching Pine's request.security("...", "D", close))
     vix_daily = fetch_yahoo("^VIX", days=100, interval="1d")
-    cpc_daily = fetch_cboe_cpc_daily(100)
     breadth_daily = fetch_yahoo("^SPXA50R", days=30, interval="1d")
+
+    # CPC from ycharts (daily, latest 10 values for SMA)
+    cpc_daily = fetch_cpc_from_ycharts(CONFIG["CPC_SMA_LENGTH"])
 
     if not ticker_weekly or not vix_daily:
         print("ERROR: Failed to fetch ticker or VIX data.")
@@ -161,10 +171,16 @@ def run():
     ma_arr = sma(weekly_closes, CONFIG["MA_LENGTH"])
     rsi_arr = rsi(weekly_closes, CONFIG["RSI_LENGTH"])
 
-    # Daily indicators (VIX SMA, CPC SMA)
+    # Daily indicators (VIX SMA)
     vix_closes = [d["close"] for d in vix_daily]
     vix_sma_arr = sma(vix_closes, CONFIG["VIX_SMA_LENGTH"])
-    cpc_sma_arr = sma(cpc_daily, CONFIG["CPC_SMA_LENGTH"]) if has_cpc else []
+
+    # CPC SMA — ycharts data is newest-first, reverse for SMA calc
+    if has_cpc:
+        cpc_reversed = list(reversed(cpc_daily))  # oldest to newest
+        cpc_sma_arr = sma(cpc_reversed, CONFIG["CPC_SMA_LENGTH"])
+    else:
+        cpc_sma_arr = []
 
     # Latest values
     price = weekly_closes[-1]
