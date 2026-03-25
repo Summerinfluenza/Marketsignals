@@ -1,19 +1,26 @@
 """
-Market Top & Bottom Signals v5 (Weekly)
-Fetches data from Yahoo Finance + CBOE, scores conditions, emails results.
-Run via GitHub Actions on a weekly schedule.
+Market Top & Bottom Signals v5
+Exact match to Pine Script on a weekly TradingView chart.
+
+Pine behavior on weekly chart:
+- ta.sma(close, 200) = 200-WEEK MA
+- ta.rsi(close, 14)  = 14-WEEK RSI
+- request.security("CPC", "D", close)  = daily CPC, SMA on daily
+- request.security("CBOE:VIX", "D", close) = daily VIX, SMA on daily
+- request.security("S5FI", "D", close) = daily breadth
+- pct_over_ma uses weekly close vs 200-week MA
 """
 
 import os
 import json
 import smtplib
 import urllib.request
-import urllib.error
+import urllib.parse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 
-# --- CONFIG (matches Pine Script thresholds) ---
+# --- CONFIG (matches Pine input.* defaults) ---
 CONFIG = {
     "TICKER": "SPY",
     "VIX_FEAR": 20,
@@ -26,21 +33,25 @@ CONFIG = {
     "BREADTH_THRESHOLD": 50.0,
     "MIN_BOTTOM": 2,
     "MIN_TOP": 3,
-    "RSI_LENGTH": 14,
-    "VIX_SMA_LENGTH": 10,
-    "CPC_SMA_LENGTH": 10,
-    "MA_LENGTH": 200,
+    "RSI_LENGTH": 14,          # 14 weeks (weekly candles)
+    "VIX_SMA_LENGTH": 10,      # 10 days (daily data)
+    "CPC_SMA_LENGTH": 10,      # 10 days (daily data)
+    "MA_LENGTH": 200,          # 200 weeks (weekly candles)
 }
+
 
 # --- DATA FETCHERS ---
 
-def fetch_yahoo_weekly(symbol, weeks=80):
-    """Fetch weekly candles from Yahoo Finance."""
+def fetch_yahoo(symbol, days=None, weeks=None, interval="1d"):
+    """Fetch candles from Yahoo Finance."""
     now = int(datetime.now().timestamp())
-    period1 = now - weeks * 7 * 86400
+    if weeks:
+        period1 = now - weeks * 7 * 86400
+    else:
+        period1 = now - days * 86400
     url = (
         f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}"
-        f"?period1={period1}&period2={now}&interval=1wk"
+        f"?period1={period1}&period2={now}&interval={interval}"
     )
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -59,8 +70,8 @@ def fetch_yahoo_weekly(symbol, weeks=80):
         return []
 
 
-def fetch_cboe_cpc_weekly(num_weeks=30):
-    """Fetch CBOE total put/call ratio CSV, convert to weekly."""
+def fetch_cboe_cpc_daily(num_days=100):
+    """Fetch CBOE total put/call ratio CSV, return daily values."""
     url = "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/totalpc.csv"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -71,7 +82,6 @@ def fetch_cboe_cpc_weekly(num_weeks=30):
         return []
 
     lines = csv_text.strip().split("\n")
-    # Find header row
     start_idx = 0
     for i, line in enumerate(lines):
         if "DATE" in line.upper() and "P/C" in line.upper():
@@ -87,23 +97,11 @@ def fetch_cboe_cpc_weekly(num_weeks=30):
             ratio = float(cols[4])
             parts = cols[0].split("/")
             dt = datetime(int(parts[2]), int(parts[0]), int(parts[1]))
-            daily.append({"date": dt, "close": ratio})
+            daily.append(ratio)
         except (ValueError, IndexError):
             continue
 
-    # Convert to weekly (last daily value per week)
-    weekly = []
-    last_week_key = None
-    for i, d in enumerate(daily):
-        week_key = (d["date"] - timedelta(days=d["date"].weekday())).strftime("%Y-%W")
-        if week_key != last_week_key:
-            if last_week_key is not None and i > 0:
-                weekly.append(daily[i - 1]["close"])
-            last_week_key = week_key
-    if daily:
-        weekly.append(daily[-1]["close"])
-
-    return weekly[-num_weeks:]
+    return daily[-num_days:]
 
 
 # --- INDICATORS ---
@@ -142,35 +140,41 @@ def rsi(closes, period):
 
 def run():
     print("Fetching data...")
-    ticker_data = fetch_yahoo_weekly(CONFIG["TICKER"], 80)
-    vix_data = fetch_yahoo_weekly("^VIX", 30)
-    cpc_weekly = fetch_cboe_cpc_weekly(30)
-    breadth_data = fetch_yahoo_weekly("^SPXA50R", 10)
 
-    if not ticker_data or not vix_data:
+    # WEEKLY candles for price, RSI, 200-week MA (need 220+ weeks for warmup)
+    ticker_weekly = fetch_yahoo(CONFIG["TICKER"], weeks=250, interval="1wk")
+
+    # DAILY data for VIX, CPC, breadth (matching Pine's request.security("...", "D", close))
+    vix_daily = fetch_yahoo("^VIX", days=100, interval="1d")
+    cpc_daily = fetch_cboe_cpc_daily(100)
+    breadth_daily = fetch_yahoo("^SPXA50R", days=30, interval="1d")
+
+    if not ticker_weekly or not vix_daily:
         print("ERROR: Failed to fetch ticker or VIX data.")
         return
 
-    has_cpc = len(cpc_weekly) >= CONFIG["CPC_SMA_LENGTH"]
-    has_breadth = len(breadth_data) > 0
+    has_cpc = len(cpc_daily) >= CONFIG["CPC_SMA_LENGTH"]
+    has_breadth = len(breadth_daily) > 0
 
-    ticker_closes = [d["close"] for d in ticker_data]
-    vix_closes = [d["close"] for d in vix_data]
+    # Weekly indicators (RSI, 200-week MA, % over MA)
+    weekly_closes = [d["close"] for d in ticker_weekly]
+    ma_arr = sma(weekly_closes, CONFIG["MA_LENGTH"])
+    rsi_arr = rsi(weekly_closes, CONFIG["RSI_LENGTH"])
 
-    ma_arr = sma(ticker_closes, CONFIG["MA_LENGTH"])
-    rsi_arr = rsi(ticker_closes, CONFIG["RSI_LENGTH"])
+    # Daily indicators (VIX SMA, CPC SMA)
+    vix_closes = [d["close"] for d in vix_daily]
     vix_sma_arr = sma(vix_closes, CONFIG["VIX_SMA_LENGTH"])
-    cpc_sma_arr = sma(cpc_weekly, CONFIG["CPC_SMA_LENGTH"]) if has_cpc else []
+    cpc_sma_arr = sma(cpc_daily, CONFIG["CPC_SMA_LENGTH"]) if has_cpc else []
 
-    last = lambda arr: arr[-1] if arr else None
-    price = last(ticker_closes)
-    ma = last(ma_arr)
-    rs = last(rsi_arr)
-    vs = last(vix_sma_arr)
-    cs = last(cpc_sma_arr) if has_cpc else None
-    br = breadth_data[-1]["close"] if has_breadth else None
+    # Latest values
+    price = weekly_closes[-1]
+    ma = ma_arr[-1]
+    rs = rsi_arr[-1]
+    vs = vix_sma_arr[-1] if vix_sma_arr else None
+    cs = cpc_sma_arr[-1] if cpc_sma_arr else None
+    br = breadth_daily[-1]["close"] if has_breadth else None
     pct_ma = ((price - ma) / ma) * 100 if ma else None
-    dt = ticker_data[-1]["date"]
+    dt = ticker_weekly[-1]["date"]
 
     # --- BOTTOM SCORING (4 conditions) ---
     b1 = vs is not None and vs > CONFIG["VIX_FEAR"]
@@ -193,43 +197,43 @@ def run():
 
     # --- BUILD REPORT ---
     fmt = lambda v, d=2: f"{v:.{d}f}" if v is not None else "N/A"
-    check = lambda v: "YES ✅" if v else "No  ❌"
+    chk = lambda v: "YES" if v else "No"
 
     report = f"""
-═══════════════════════════════════════════
+=============================================
   WEEKLY MARKET SIGNALS — {CONFIG['TICKER']}
   {dt.strftime('%Y-%m-%d')}
-═══════════════════════════════════════════
+=============================================
 
-  {CONFIG['TICKER']} Price:      {fmt(price)}
-  VIX SMA({CONFIG['VIX_SMA_LENGTH']}w):    {fmt(vs)}
-  CPC SMA({CONFIG['CPC_SMA_LENGTH']}w):    {fmt(cs, 3) if cs else 'N/A'}
-  RSI({CONFIG['RSI_LENGTH']}w):        {fmt(rs)}
-  40-Week MA:       {fmt(ma)}
-  % Above 40w MA:   {fmt(pct_ma)}%
-  Breadth:          {fmt(br, 1)}%
+  {CONFIG['TICKER']} Price:        {fmt(price)}
+  200-Week MA:       {fmt(ma)}
+  % Above 200w MA:   {fmt(pct_ma)}%
+  RSI(14w):          {fmt(rs)}
+  VIX SMA(10d):      {fmt(vs)}
+  CPC SMA(10d):      {fmt(cs, 3) if cs else 'N/A'}
+  Breadth:           {fmt(br, 1) if br else 'N/A'}%
 
-───────────────────────────────────────────
-  BOTTOM CONDITIONS ({b_score}/4)
-───────────────────────────────────────────
-  VIX SMA > {CONFIG['VIX_FEAR']}:          {check(b1)}  ({fmt(vs)})
-  CPC SMA > {CONFIG['CPC_FEAR']}:         {check(b2)}  ({fmt(cs, 3) if cs else 'N/A'})
-  RSI < {CONFIG['RSI_OVERSOLD']}:              {check(b3)}  ({fmt(rs)})
-  Price < 40w MA:         {check(b4)}  ({fmt(price)} vs {fmt(ma)})
+---------------------------------------------
+  BOTTOM CONDITIONS ({b_score}/4, need {CONFIG['MIN_BOTTOM']})
+---------------------------------------------
+  VIX SMA > {CONFIG['VIX_FEAR']}:            {chk(b1):3s}   (VIX SMA = {fmt(vs)})
+  CPC SMA > {CONFIG['CPC_FEAR']}:           {chk(b2):3s}   (CPC SMA = {fmt(cs, 3) if cs else 'N/A'})
+  RSI < {CONFIG['RSI_OVERSOLD']}:                {chk(b3):3s}   (RSI = {fmt(rs)})
+  Price < 200w MA:          {chk(b4):3s}   ({fmt(price)} vs {fmt(ma)})
 
-───────────────────────────────────────────
-  TOP CONDITIONS ({t_score}/5)
-───────────────────────────────────────────
-  RSI > {CONFIG['RSI_OVERBOUGHT']}:              {check(t1)}  ({fmt(rs)})
-  CPC SMA < {CONFIG['CPC_GREED']}:         {check(t2)}  ({fmt(cs, 3) if cs else 'N/A'})
-  VIX SMA < {CONFIG['VIX_COMPLACENT']}:          {check(t3)}  ({fmt(vs)})
-  % Above MA > {CONFIG['PCT_ABOVE_MA']}%:   {check(t4)}  ({fmt(pct_ma)}%)
-  Breadth < {CONFIG['BREADTH_THRESHOLD']}%:      {check(t5)}  ({fmt(br, 1)}%)
+---------------------------------------------
+  TOP CONDITIONS ({t_score}/5, need {CONFIG['MIN_TOP']})
+---------------------------------------------
+  RSI > {CONFIG['RSI_OVERBOUGHT']}:                {chk(t1):3s}   (RSI = {fmt(rs)})
+  CPC SMA < {CONFIG['CPC_GREED']}:           {chk(t2):3s}   (CPC SMA = {fmt(cs, 3) if cs else 'N/A'})
+  VIX SMA < {CONFIG['VIX_COMPLACENT']}:            {chk(t3):3s}   (VIX SMA = {fmt(vs)})
+  % Above MA > {CONFIG['PCT_ABOVE_MA']}%:     {chk(t4):3s}   ({fmt(pct_ma)}%)
+  Breadth < {CONFIG['BREADTH_THRESHOLD']}%:        {chk(t5):3s}   ({fmt(br, 1) if br else 'N/A'}%)
 
-═══════════════════════════════════════════
+=============================================
   SIGNAL:  *** {signal} ***
   Bottom: {b_score}/4  |  Top: {t_score}/5
-═══════════════════════════════════════════
+=============================================
 """
 
     print(report)
@@ -246,7 +250,7 @@ def run():
         print("Set EMAIL_TO, EMAIL_FROM, EMAIL_PASSWORD as environment variables.")
         return
 
-    subject = f"{CONFIG['TICKER']} Weekly Signal: {signal} ({dt.strftime('%Y-%m-%d')})"
+    subject = f"{CONFIG['TICKER']} Weekly: {signal} ({dt.strftime('%Y-%m-%d')})"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
