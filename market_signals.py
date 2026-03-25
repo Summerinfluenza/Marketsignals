@@ -29,7 +29,7 @@ CONFIG = {
     "RSI_LENGTH": 14,
     "VIX_SMA_LENGTH": 10,
     "CPC_SMA_LENGTH": 10,
-    "MA_LENGTH": 40,
+    "MA_LENGTH": 200,
 }
 
 # --- DATA FETCHERS ---
