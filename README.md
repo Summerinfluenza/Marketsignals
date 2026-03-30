@@ -1,65 +1,172 @@
-# Marketsignals# Market Top \& Bottom Signals v5
+# Market Signals
 
-Weekly market signal scanner that emails you BUY/SELL/NEUTRAL signals based on VIX, Put/Call Ratio, RSI, Moving Average, and Market Breadth.
+A lightweight Python script that emails you a daily pre-market report with technical signals and a curated news feed — no paid services required.
 
-## Setup (5 minutes)
+---
 
-### 1\. Fork or create this repo on GitHub
+## What it does
 
-Copy these files into a new GitHub repo:
+Every weekday at **9:00 AM ET** (30 minutes before US market open) you get an email with two sections:
+
+**Daily signals** — fast-moving sentiment indicators
+- VIX SMA (10-day)
+- Put/Call Ratio SMA (10-day)
+- Market Breadth (% of S&P 500 stocks above 50-day MA)
+- CNN Fear & Greed Index
+
+**Weekly signals** — structural trend indicators
+- 200-week Moving Average vs price
+- 14-week RSI
+- % price is above the 200-week MA
+
+Each indicator is scored YES/NO against a threshold. When enough conditions align, the report flags a **Bottom Watch** or **Top Watch** zone.
+
+**News feed** (optional) — today's headlines from ZeroHedge, The Market Ear, Jam Croissant and Ozzy Livin, pulled via RSS. If you add a Gemini API key, the headlines are summarised into 3–5 bullet points by AI.
+
+---
+
+## Files
 
 ```
-market\\\_signals.py
-.github/workflows/weekly\\\_signals.yml
+market_signals.py   — indicators, scoring, email, scheduler
+market_news.py      — RSS news feed + optional Gemini summary
 ```
 
-### 2\. Set up email (Gmail recommended)
+---
 
-For Gmail, you need an **App Password** (not your regular password):
+## Running on GitHub Actions (recommended)
 
-* Go to https://myaccount.google.com/apppasswords
-* Create an app password for "Mail"
-* Copy the 16-character password
+This is the easiest way — GitHub runs the script for you on a schedule, no server needed.
 
-### 3\. Add secrets to GitHub
+### 1. Fork this repo
 
-Go to your repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
+Click **Fork** at the top of this page.
 
-Add these 5 secrets:
+### 2. Add your secrets
 
-|Secret Name|Value|
-|-|-|
-|`EMAIL\\\_TO`|your.email@gmail.com|
-|`EMAIL\\\_FROM`|your.email@gmail.com|
-|`EMAIL\\\_PASSWORD`|your-16-char-app-password|
-|`SMTP\\\_SERVER`|smtp.gmail.com|
-|`SMTP\\\_PORT`|587|
+Go to your fork → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
 
-### 4\. Done!
+| Secret | Value |
+|---|---|
+| `EMAIL_TO` | Address to receive the report |
+| `EMAIL_FROM` | Gmail address to send from |
+| `EMAIL_PASSWORD` | Gmail [App Password](https://myaccount.google.com/apppasswords) (not your login password) |
 
-The script runs automatically every **Friday at 9 PM UTC** (after US market close).
+Optional extras:
 
-To test it immediately:
+| Secret | Value |
+|---|---|
+| `TICKER` | Ticker to track — default is `SPY` |
+| `GEMINI_API_KEY` | [Free Gemini key](https://aistudio.google.com/app/apikey) — enables AI news summary |
 
-* Go to **Actions** tab → **Weekly Market Signals** → **Run workflow** → **Run workflow**
+> **Gmail App Password**: go to myaccount.google.com/apppasswords, create one for "Mail", copy the 16-character code.
 
-## What you get
+### 3. Create the workflow file
 
-A weekly email with:
+Create `.github/workflows/daily_signals.yml` in your repo with this content:
 
-* Current values for all indicators (VIX SMA, CPC SMA, RSI, % above MA, Breadth)
-* Each condition scored YES/NO for both bottom and top signals
-* Final signal: **BUY ZONE**, **SELL ZONE**, or **NEUTRAL**
+```yaml
+name: Daily Market Signals
 
-## Customization
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'   # 14:00 UTC = 9:00 AM ET (adjust for DST if needed)
+  workflow_dispatch:           # lets you trigger manually from the Actions tab
 
-Edit the `CONFIG` dict in `market\\\_signals.py` to change:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install google-generativeai
+      - name: Run signals
+        env:
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          TICKER:         ${{ secrets.TICKER }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python market_signals.py both
+```
 
-* `TICKER`: SPY, QQQ, IWM, etc.
-* Thresholds for all indicators
-* `MIN\\\_BOTTOM` / `MIN\\\_TOP`: how many conditions must be met
+### 4. Done
 
-## No dependencies
+Go to the **Actions** tab and hit **Run workflow** to test it immediately. After that it runs automatically on weekdays.
 
-Uses only Python standard library — no pip install needed.
+---
 
+## Running locally
+
+```bash
+# Clone
+git clone https://github.com/your-username/Marketsignals.git
+cd Marketsignals
+
+# Optional: install Gemini for AI summaries
+pip install google-generativeai
+
+# Set credentials
+export EMAIL_TO="you@gmail.com"
+export EMAIL_FROM="you@gmail.com"
+export EMAIL_PASSWORD="your-app-password"
+export GEMINI_API_KEY="your-key"   # optional
+
+# Run
+python market_signals.py           # both reports + news
+python market_signals.py daily     # daily signals only
+python market_signals.py weekly    # weekly signals only
+python market_signals.py schedule  # daemon: auto-fires at 9:00 AM ET on weekdays
+
+# News feed only
+python market_news.py              # headlines
+python market_news.py summary      # headlines + Gemini summary
+```
+
+---
+
+## Customisation
+
+All thresholds are at the top of `market_signals.py`:
+
+```python
+WEEKLY = {
+    "RSI_OVERSOLD":   30,    # RSI below this → bottom condition
+    "RSI_OVERBOUGHT": 70,    # RSI above this → top condition
+    "PCT_ABOVE_MA":   40.0,  # % above 200w MA → top condition
+}
+
+DAILY = {
+    "VIX_FEAR":          20,   # VIX SMA above → fear (bottom)
+    "VIX_COMPLACENT":    13,   # VIX SMA below → complacency (top)
+    "CPC_FEAR":          1.0,  # Put/Call above → fear (bottom)
+    "CPC_GREED":         0.8,  # Put/Call below → greed (top)
+    "FG_BUY":            25,   # CNN F&G below → extreme fear (bottom)
+    "FG_CAUTION":        70,   # CNN F&G above → greed (top)
+}
+```
+
+To follow different accounts, edit `FEEDS` in `market_news.py`:
+
+```python
+FEEDS = {
+    "zerohedge":     "https://feeds.feedburner.com/zerohedge/feed",
+    "jam_croissant": "https://jamcroissant.substack.com/feed",
+    "themarketear":  "nitter://themarketear",   # X-only accounts use nitter://
+    "ozzy_livin":    "nitter://ozzy_livin",
+}
+```
+
+---
+
+## Dependencies
+
+| Package | Required | Purpose |
+|---|---|---|
+| *(stdlib only)* | Always | Signals, RSS feed, email |
+| `google-generativeai` | Optional | Gemini AI news summary |
+
+Python 3.9+ required (uses `zoneinfo`).
