@@ -99,13 +99,20 @@ def fetch_cnn_fg():
     """
     Fetch current CNN Fear & Greed Index score (0–100).
     Returns float or None on error. No API key required.
+    CNN requires browser-like headers (Referer/Origin) or returns HTTP 418.
     """
     url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    req = urllib.request.Request(url, headers={
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept":          "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer":         "https://edition.cnn.com/markets/fear-and-greed",
+        "Origin":          "https://edition.cnn.com",
+    })
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
-        score = float(data["fear_and_greed"]["score"])
+        score  = float(data["fear_and_greed"]["score"])
         rating = data["fear_and_greed"]["rating"]
         print(f"CNN F&G: {score:.1f} ({rating})")
         return score

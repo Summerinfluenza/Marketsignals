@@ -82,7 +82,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install dependencies
-        run: pip install google-generativeai
+        run: pip install google-genai
       - name: Run signals
         env:
           EMAIL_TO:       ${{ secrets.EMAIL_TO }}
@@ -166,7 +166,7 @@ FEEDS = {
 
 | Package | Required | Purpose |
 |---|---|---|
-| *(stdlib only)* | Always | Signals, RSS feed, email |
-| `google-generativeai` | Optional | Gemini AI news summary |
+| *(stdlib only)* | Always | Signals, email, scheduler |
+| `google-genai` | Optional | Gemini news feed + AI summary |
 
 Python 3.9+ required (uses `zoneinfo`).
