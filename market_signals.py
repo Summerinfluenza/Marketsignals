@@ -407,10 +407,19 @@ def start_scheduler():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 
+def run_news():
+    block = build_twitter_block()
+    print(block or "No news available (is GEMINI_API_KEY set?)")
+    if block:
+        date_str = datetime.now(ET).strftime("%Y-%m-%d")
+        _send_email(f"{TICKER} Market News {date_str}", block)
+
+
 _COMMANDS = {
     "daily":    run_daily,
     "weekly":   run_weekly,
     "both":     run_both,
+    "news":     run_news,
     "schedule": start_scheduler,
 }
 

@@ -1,9 +1,23 @@
-name: Weekly Market Signals
+name: Daily Market Signals
 
 on:
   schedule:
-    - cron: '0 21 * * 5'
+    - cron: '0 14 * * 1-5'   # 14:00 UTC = 09:00 ET (Mon–Fri)
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'What to run'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - daily
+          - weekly
+          - news
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   check-signals:
@@ -11,16 +25,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
+      - name: Install dependencies
+        run: pip install google-genai
+
       - name: Run Market Signals
         env:
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-        run: python market_signals.py
+          SMTP_SERVER:    ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT:      ${{ secrets.SMTP_PORT }}
+          TICKER:         ${{ secrets.TICKER }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python market_signals.py ${{ github.event.inputs.mode || 'both' }}
