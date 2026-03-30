@@ -52,13 +52,13 @@ WEEKLY = {
 DAILY = {
     "VIX_SMA_LENGTH":    10,
     "CPC_SMA_LENGTH":    10,
-    "VIX_FEAR":          20,    # VIX SMA above → fear (bottom signal)
-    "VIX_COMPLACENT":    13,    # VIX SMA below → complacency (top signal)
-    "CPC_FEAR":          1.0,   # CPC SMA above → fear (bottom signal)
-    "CPC_GREED":         0.8,   # CPC SMA below → greed (top signal)
-    "BREADTH_THRESHOLD": 50.0,  # % stocks above 50-day MA; below → weak breadth
-    "FG_BUY":            25,    # CNN F&G below → extreme fear (bottom signal)
-    "FG_CAUTION":        70,    # CNN F&G above → greed (top signal)
+    "VIX_FEAR":       20,    # VIX SMA above → fear (bottom signal)
+    "VIX_COMPLACENT": 13,    # VIX SMA below → complacency (top signal)
+    "CPC_FEAR":       1.0,   # CPC SMA above → fear (bottom signal)
+    "CPC_GREED":      0.8,   # CPC SMA below → greed (top signal)
+    "FG_BUY":         25,    # CNN F&G below → extreme fear (bottom signal)
+    "FG_CAUTION":     70,    # CNN F&G above → greed (top signal)
+    # Note: breadth is already a component of the CNN F&G index
 }
 
 # ── NEWS INTEGRATION (optional) ───────────────────────────────────────────────
@@ -219,8 +219,7 @@ def compute_weekly():
 
 def compute_daily():
     """Returns daily indicator dict or None on error."""
-    vix_raw = fetch_yahoo("^VIX",     days=100, interval="1d")
-    breadth = fetch_yahoo("^SPXA50R", days=30,  interval="1d")
+    vix_raw = fetch_yahoo("^VIX", days=100, interval="1d")
     cpc_raw = fetch_cpc(DAILY["CPC_SMA_LENGTH"])
     fg      = fetch_cnn_fg()
 
@@ -229,7 +228,6 @@ def compute_daily():
 
     vix_closes = [d["close"] for d in vix_raw]
     vs = sma(vix_closes, DAILY["VIX_SMA_LENGTH"])[-1]
-    br = breadth[-1]["close"] if breadth else None
     cs = None
     if len(cpc_raw) >= DAILY["CPC_SMA_LENGTH"]:
         cs = sma(list(reversed(cpc_raw)), DAILY["CPC_SMA_LENGTH"])[-1]
@@ -239,16 +237,15 @@ def compute_daily():
     b_fg  = fg is not None and fg < DAILY["FG_BUY"]
     t_cpc = cs is not None and cs < DAILY["CPC_GREED"]
     t_vix = vs is not None and vs < DAILY["VIX_COMPLACENT"]
-    t_br  = br is not None and br < DAILY["BREADTH_THRESHOLD"]
     t_fg  = fg is not None and fg > DAILY["FG_CAUTION"]
 
     return {
         "date":    datetime.now(ET),
-        "vix_sma": vs, "cpc_sma": cs, "breadth": br, "fg": fg,
+        "vix_sma": vs, "cpc_sma": cs, "fg": fg,
         "b_vix": b_vix, "b_cpc": b_cpc, "b_fg": b_fg,
-        "t_vix": t_vix, "t_cpc": t_cpc, "t_br": t_br, "t_fg": t_fg,
+        "t_vix": t_vix, "t_cpc": t_cpc, "t_fg": t_fg,
         "b_score": sum([b_vix, b_cpc, b_fg]),
-        "t_score": sum([t_vix, t_cpc, t_br, t_fg]),
+        "t_score": sum([t_vix, t_cpc, t_fg]),
     }
 
 
@@ -288,27 +285,24 @@ def format_daily(d):
     t_zone = d["t_score"] >= 2
     signal = "→ BOTTOM WATCH" if b_zone else ("→ TOP WATCH" if t_zone else "→ NEUTRAL")
     cs_str = _fmt(d["cpc_sma"], 3) if d["cpc_sma"] is not None else "N/A"
-    br_str = _fmt(d["breadth"], 1) if d["breadth"] is not None else "N/A"
     fg_str = _fmt(d["fg"], 1)      if d["fg"]      is not None else "N/A"
     return f"""
 ╔═══════════════════════════════════════════╗
 ║  DAILY SIGNALS — {TICKER:<6}   {d['date'].strftime('%Y-%m-%d')}  ║
 ╠═══════════════════════════════════════════╣
-  VIX SMA ({DAILY['VIX_SMA_LENGTH']}d):      {_fmt(d['vix_sma'])}
-  CPC SMA ({DAILY['CPC_SMA_LENGTH']}d):      {cs_str}
-  Breadth (SPXA50R): {br_str}%
+  VIX SMA ({DAILY['VIX_SMA_LENGTH']}d):     {_fmt(d['vix_sma'])}
+  CPC SMA ({DAILY['CPC_SMA_LENGTH']}d):     {cs_str}
   CNN Fear & Greed:  {fg_str}/100
 
   BOTTOM conditions ({d['b_score']}/3, need 2)
-    VIX SMA > {DAILY['VIX_FEAR']}:       {_chk(d['b_vix']):3s}  (VIX SMA = {_fmt(d['vix_sma'])})
-    CPC SMA > {DAILY['CPC_FEAR']}:      {_chk(d['b_cpc']):3s}  (CPC SMA = {cs_str})
-    F&G < {DAILY['FG_BUY']} (extreme fear): {_chk(d['b_fg']):3s}  (F&G = {fg_str})
+    VIX SMA > {DAILY['VIX_FEAR']}:             {_chk(d['b_vix']):3s}  (VIX SMA = {_fmt(d['vix_sma'])})
+    CPC SMA > {DAILY['CPC_FEAR']}:            {_chk(d['b_cpc']):3s}  (CPC SMA = {cs_str})
+    F&G < {DAILY['FG_BUY']} (extreme fear):    {_chk(d['b_fg']):3s}  (F&G = {fg_str})
 
-  TOP conditions ({d['t_score']}/4, need 2)
-    CPC SMA < {DAILY['CPC_GREED']}:      {_chk(d['t_cpc']):3s}  (CPC SMA = {cs_str})
-    VIX SMA < {DAILY['VIX_COMPLACENT']}:       {_chk(d['t_vix']):3s}  (VIX SMA = {_fmt(d['vix_sma'])})
-    Breadth < {DAILY['BREADTH_THRESHOLD']}%:    {_chk(d['t_br']):3s}  ({br_str}%)
-    F&G > {DAILY['FG_CAUTION']} (greed):       {_chk(d['t_fg']):3s}  (F&G = {fg_str})
+  TOP conditions ({d['t_score']}/3, need 2)
+    CPC SMA < {DAILY['CPC_GREED']}:            {_chk(d['t_cpc']):3s}  (CPC SMA = {cs_str})
+    VIX SMA < {DAILY['VIX_COMPLACENT']}:            {_chk(d['t_vix']):3s}  (VIX SMA = {_fmt(d['vix_sma'])})
+    F&G > {DAILY['FG_CAUTION']} (greed):           {_chk(d['t_fg']):3s}  (F&G = {fg_str})
 
   {signal}
 ╚═══════════════════════════════════════════╝"""
