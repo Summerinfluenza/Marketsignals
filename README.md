@@ -1,6 +1,6 @@
 # Market Signals
 
-A lightweight Python script that emails you a daily pre-market report with technical signals and a curated news feed — no paid services required.
+A lightweight Python script that emails you a daily pre-market report with technical signals — no paid services required.
 
 ---
 
@@ -11,7 +11,6 @@ Every weekday at **9:00 AM ET** (30 minutes before US market open) you get an em
 **Daily signals** — fast-moving sentiment indicators
 - VIX SMA (10-day)
 - Put/Call Ratio SMA (10-day)
-- Market Breadth (% of S&P 500 stocks above 50-day MA)
 - CNN Fear & Greed Index
 
 **Weekly signals** — structural trend indicators
@@ -19,9 +18,7 @@ Every weekday at **9:00 AM ET** (30 minutes before US market open) you get an em
 - 14-week RSI
 - % price is above the 200-week MA
 
-Each indicator is scored YES/NO against a threshold. When enough conditions align, the report flags a **Bottom Watch** or **Top Watch** zone.
-
-**News feed** (optional) — today's headlines from ZeroHedge, The Market Ear, Jam Croissant and Ozzy Livin, pulled via RSS. If you add a Gemini API key, the headlines are summarised into 3–5 bullet points by AI.
+Each indicator is scored YES/NO against a threshold. When enough conditions align, the report flags a **Bottom Watch** or **Top Watch** zone. The email subject line shows the current signal: **BUY**, **SELL**, or **NEUTRAL**.
 
 ---
 
@@ -29,7 +26,6 @@ Each indicator is scored YES/NO against a threshold. When enough conditions alig
 
 ```
 market_signals.py   — indicators, scoring, email, scheduler
-market_news.py      — RSS news feed + optional Gemini summary
 ```
 
 ---
@@ -56,8 +52,7 @@ Optional extras:
 
 | Secret | Value |
 |---|---|
-| `TICKER` | Ticker to track — default is `SPY` |
-| `GEMINI_API_KEY` | [Free Gemini key](https://aistudio.google.com/app/apikey) — enables AI news summary |
+| `TICKERS` | Comma-separated tickers to track — default is `SPY,QQQ` |
 
 > **Gmail App Password**: go to myaccount.google.com/apppasswords, create one for "Mail", copy the 16-character code.
 
@@ -80,22 +75,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - name: Install dependencies
-        run: pip install google-genai
+          python-version: '3.12'
       - name: Run signals
         env:
           EMAIL_TO:       ${{ secrets.EMAIL_TO }}
           EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           TICKER:         ${{ secrets.TICKER }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python market_signals.py both
 ```
 
 ### 4. Done
 
 Go to the **Actions** tab and hit **Run workflow** to test it immediately. After that it runs automatically on weekdays.
+
+---
+
+## Quick test (no email setup)
+
+```bash
+python market_signals.py both
+```
+
+This prints the full report to the terminal. Email is skipped unless `EMAIL_TO`, `EMAIL_FROM`, and `EMAIL_PASSWORD` are set.
 
 ---
 
@@ -106,24 +108,16 @@ Go to the **Actions** tab and hit **Run workflow** to test it immediately. After
 git clone https://github.com/your-username/Marketsignals.git
 cd Marketsignals
 
-# Optional: install Gemini for AI summaries
-pip install google-generativeai
-
 # Set credentials
 export EMAIL_TO="you@gmail.com"
 export EMAIL_FROM="you@gmail.com"
 export EMAIL_PASSWORD="your-app-password"
-export GEMINI_API_KEY="your-key"   # optional
 
 # Run
-python market_signals.py           # both reports + news
+python market_signals.py           # both reports
 python market_signals.py daily     # daily signals only
 python market_signals.py weekly    # weekly signals only
 python market_signals.py schedule  # daemon: auto-fires at 9:00 AM ET on weekdays
-
-# News feed only
-python market_news.py              # headlines
-python market_news.py summary      # headlines + Gemini summary
 ```
 
 ---
@@ -149,24 +143,10 @@ DAILY = {
 }
 ```
 
-To follow different accounts, edit `FEEDS` in `market_news.py`:
-
-```python
-FEEDS = {
-    "zerohedge":     "https://feeds.feedburner.com/zerohedge/feed",
-    "jam_croissant": "https://jamcroissant.substack.com/feed",
-    "themarketear":  "nitter://themarketear",   # X-only accounts use nitter://
-    "ozzy_livin":    "nitter://ozzy_livin",
-}
-```
-
 ---
 
 ## Dependencies
 
-| Package | Required | Purpose |
-|---|---|---|
-| *(stdlib only)* | Always | Signals, email, scheduler |
-| `google-genai` | Optional | Gemini news feed + AI summary |
+No external packages required. stdlib only.
 
 Python 3.9+ required (uses `zoneinfo`).

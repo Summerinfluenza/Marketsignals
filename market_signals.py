@@ -5,11 +5,9 @@ Two report modes, both delivered daily at 9:00 AM ET (30 min before open):
   DAILY  — VIX SMA, CPC SMA, Breadth (fast-moving sentiment)
   WEEKLY — 200-week MA, 14-week RSI, % over MA (structural trend)
 
-Twitter feed and Gemini AI summary live in market_news.py (imported automatically).
-
 Usage:
-  python market_signals.py            # run both + news once
-  python market_signals.py daily      # daily signals + news
+  python market_signals.py            # run both once
+  python market_signals.py daily      # daily signals only
   python market_signals.py weekly     # weekly signals only
   python market_signals.py schedule   # daemon: fires every weekday at 9:00 AM ET
 
@@ -17,8 +15,6 @@ Environment variables:
   TICKER                      — ticker to track (default: SPY)
   EMAIL_TO / EMAIL_FROM / EMAIL_PASSWORD
   SMTP_SERVER / SMTP_PORT     — default: smtp.gmail.com:587
-  X_BEARER_TOKEN              — enables Twitter feed (market_news.py)
-  GEMINI_API_KEY              — enables AI tweet summary (market_news.py)
 """
 
 import os
@@ -36,7 +32,8 @@ from zoneinfo import ZoneInfo
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-TICKER = os.environ.get("TICKER", "SPY")
+_tickers_env = os.environ.get("TICKERS") or os.environ.get("TICKER", "SPY,QQQ")
+TICKERS = [t.strip().upper() for t in _tickers_env.split(",") if t.strip()]
 ET = ZoneInfo("America/New_York")
 
 WEEKLY = {
@@ -56,18 +53,14 @@ DAILY = {
     "VIX_COMPLACENT": 13,    # VIX SMA below → complacency (top signal)
     "CPC_FEAR":       1.0,   # CPC SMA above → fear (bottom signal)
     "CPC_GREED":      0.8,   # CPC SMA below → greed (top signal)
-    "FG_BUY":         25,    # CNN F&G below → extreme fear (bottom signal)
-    "FG_CAUTION":     70,    # CNN F&G above → greed (top signal)
+    "FG_SMA_DAILY":   10,    # 10-day SMA of F&G
+    "FG_SMA_WEEKLY":  50,    # 10-week SMA of F&G (≈50 trading days)
+    "FG_BUY":         25,    # CNN F&G SMA below → extreme fear (bottom signal)
+    "FG_CAUTION":     70,    # CNN F&G SMA above → greed (top signal)
     # Note: breadth is already a component of the CNN F&G index
+    "PRICE_SMA":      200,   # 200-day SMA
+    "PRICE_RSI":      14,    # 14-day RSI
 }
-
-# ── NEWS INTEGRATION (optional) ───────────────────────────────────────────────
-
-try:
-    from market_news import build_twitter_block
-except ImportError:
-    def build_twitter_block():
-        return ""
 
 # ── DATA FETCHERS ─────────────────────────────────────────────────────────────
 
@@ -97,8 +90,8 @@ def fetch_yahoo(symbol, days=None, weeks=None, interval="1d"):
 
 def fetch_cnn_fg():
     """
-    Fetch current CNN Fear & Greed Index score (0–100).
-    Returns float or None on error. No API key required.
+    Fetch CNN Fear & Greed Index historical scores (0–100), oldest→newest.
+    Returns list of floats or [] on error. No API key required.
     CNN requires browser-like headers (Referer/Origin) or returns HTTP 418.
     """
     url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
@@ -112,13 +105,15 @@ def fetch_cnn_fg():
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
-        score  = float(data["fear_and_greed"]["score"])
-        rating = data["fear_and_greed"]["rating"]
-        print(f"CNN F&G: {score:.1f} ({rating})")
-        return score
+        hist   = data["fear_and_greed_historical"]["data"]
+        scores = [float(p["y"]) for p in hist if p.get("y") is not None]
+        current = scores[-1] if scores else None
+        rating  = data["fear_and_greed"]["rating"]
+        print(f"CNN F&G: {current:.1f} ({rating}), {len(scores)} history points")
+        return scores
     except Exception as e:
         print(f"CNN F&G fetch error: {e}")
-        return None
+        return []
 
 
 def fetch_cpc(num=10):
@@ -187,9 +182,9 @@ def rsi(closes, period):
 
 # ── SIGNAL COMPUTATION ────────────────────────────────────────────────────────
 
-def compute_weekly():
+def compute_weekly(ticker):
     """Returns weekly indicator dict or None on error."""
-    data = fetch_yahoo(TICKER, weeks=250, interval="1wk")
+    data = fetch_yahoo(ticker, weeks=250, interval="1wk")
     if not data:
         return None
 
@@ -221,7 +216,7 @@ def compute_daily():
     """Returns daily indicator dict or None on error."""
     vix_raw = fetch_yahoo("^VIX", days=100, interval="1d")
     cpc_raw = fetch_cpc(DAILY["CPC_SMA_LENGTH"])
-    fg      = fetch_cnn_fg()
+    fg_hist = fetch_cnn_fg()
 
     if not vix_raw:
         return None
@@ -232,21 +227,38 @@ def compute_daily():
     if len(cpc_raw) >= DAILY["CPC_SMA_LENGTH"]:
         cs = sma(list(reversed(cpc_raw)), DAILY["CPC_SMA_LENGTH"])[-1]
 
-    b_vix = vs is not None and vs > DAILY["VIX_FEAR"]
-    b_cpc = cs is not None and cs > DAILY["CPC_FEAR"]
-    b_fg  = fg is not None and fg < DAILY["FG_BUY"]
-    t_cpc = cs is not None and cs < DAILY["CPC_GREED"]
-    t_vix = vs is not None and vs < DAILY["VIX_COMPLACENT"]
-    t_fg  = fg is not None and fg > DAILY["FG_CAUTION"]
+    fg     = fg_hist[-1] if fg_hist else None
+    fg_d   = sma(fg_hist, DAILY["FG_SMA_DAILY"])[-1]  if len(fg_hist) >= DAILY["FG_SMA_DAILY"]  else None
+    fg_w   = sma(fg_hist, DAILY["FG_SMA_WEEKLY"])[-1] if len(fg_hist) >= DAILY["FG_SMA_WEEKLY"] else None
+
+    b_vix = vs   is not None and vs   > DAILY["VIX_FEAR"]
+    b_cpc = cs   is not None and cs   > DAILY["CPC_FEAR"]
+    b_fg  = fg_d is not None and fg_d < DAILY["FG_BUY"]
+    t_cpc = cs   is not None and cs   < DAILY["CPC_GREED"]
+    t_vix = vs   is not None and vs   < DAILY["VIX_COMPLACENT"]
+    t_fg  = fg_d is not None and fg_d > DAILY["FG_CAUTION"]
 
     return {
         "date":    datetime.now(ET),
-        "vix_sma": vs, "cpc_sma": cs, "fg": fg,
+        "vix_sma": vs, "cpc_sma": cs, "fg": fg, "fg_sma_d": fg_d, "fg_sma_w": fg_w,
         "b_vix": b_vix, "b_cpc": b_cpc, "b_fg": b_fg,
         "t_vix": t_vix, "t_cpc": t_cpc, "t_fg": t_fg,
         "b_score": sum([b_vix, b_cpc, b_fg]),
         "t_score": sum([t_vix, t_cpc, t_fg]),
     }
+
+
+def compute_price(ticker):
+    """Returns daily price, 200d SMA, % vs SMA, and 14d RSI for a ticker."""
+    data = fetch_yahoo(ticker, days=300, interval="1d")
+    if not data:
+        return None
+    closes  = [d["close"] for d in data]
+    price   = closes[-1]
+    sma200  = sma(closes, DAILY["PRICE_SMA"])[-1]
+    pct     = ((price - sma200) / sma200 * 100) if sma200 else None
+    rsi14   = rsi(closes, DAILY["PRICE_RSI"])[-1]
+    return {"ticker": ticker, "price": price, "sma200": sma200, "pct": pct, "rsi": rsi14}
 
 
 # ── REPORT FORMATTING ─────────────────────────────────────────────────────────
@@ -255,13 +267,13 @@ def _fmt(v, d=2): return f"{v:.{d}f}" if v is not None else "N/A"
 def _chk(v):      return "YES" if v else "No"
 
 
-def format_weekly(w):
+def format_weekly(w, ticker):
     b_zone = w["b_score"] >= WEEKLY["MIN_BOTTOM"]
     t_zone = w["t_score"] >= WEEKLY["MIN_TOP"]
     signal = "→ BOTTOM WATCH" if b_zone else ("→ TOP WATCH" if t_zone else "→ NEUTRAL")
     return f"""
 ╔═══════════════════════════════════════════╗
-║  WEEKLY SIGNALS — {TICKER:<6}  {w['date'].strftime('%Y-%m-%d')}  ║
+║  WEEKLY SIGNALS — {ticker:<6}  {w['date'].strftime('%Y-%m-%d')}  ║
 ╠═══════════════════════════════════════════╣
   Price:            {_fmt(w['price'])}
   200-Week MA:      {_fmt(w['ma'])}
@@ -280,29 +292,48 @@ def format_weekly(w):
 ╚═══════════════════════════════════════════╝"""
 
 
-def format_daily(d):
+def format_daily(d, prices=None):
     b_zone = d["b_score"] >= 2
     t_zone = d["t_score"] >= 2
     signal = "→ BOTTOM WATCH" if b_zone else ("→ TOP WATCH" if t_zone else "→ NEUTRAL")
-    cs_str = _fmt(d["cpc_sma"], 3) if d["cpc_sma"] is not None else "N/A"
-    fg_str = _fmt(d["fg"], 1)      if d["fg"]      is not None else "N/A"
+    cs_str   = _fmt(d["cpc_sma"], 3) if d["cpc_sma"]   is not None else "N/A"
+    fg_str   = _fmt(d["fg"],    1)   if d["fg"]         is not None else "N/A"
+    fg_d_str = _fmt(d["fg_sma_d"],1) if d["fg_sma_d"]  is not None else "N/A"
+    fg_w_str = _fmt(d["fg_sma_w"],1) if d["fg_sma_w"]  is not None else "N/A"
+    label    = " & ".join(TICKERS)
+
+    price_sections = ""
+    for p in (prices or []):
+        if not p:
+            continue
+        pct_str = (f"+{p['pct']:.2f}%" if p["pct"] >= 0 else f"{p['pct']:.2f}%") if p["pct"] is not None else "N/A"
+        price_sections += f"""
+  ── {p['ticker']} ──────────────────────────────
+  Price:              {_fmt(p['price'])}
+  200-Day SMA:        {_fmt(p['sma200'])}
+  % vs 200d SMA:      {pct_str}
+  RSI (14d):          {_fmt(p['rsi'], 1)}"""
+
     return f"""
 ╔═══════════════════════════════════════════╗
-║  DAILY SIGNALS — {TICKER:<6}   {d['date'].strftime('%Y-%m-%d')}  ║
+║  DAILY SIGNALS — {label:<6}   {d['date'].strftime('%Y-%m-%d')}  ║
 ╠═══════════════════════════════════════════╣
-  VIX SMA ({DAILY['VIX_SMA_LENGTH']}d):     {_fmt(d['vix_sma'])}
-  CPC SMA ({DAILY['CPC_SMA_LENGTH']}d):     {cs_str}
-  CNN Fear & Greed:  {fg_str}/100
+  VIX SMA ({DAILY['VIX_SMA_LENGTH']}d):          {_fmt(d['vix_sma'])}
+  CPC SMA ({DAILY['CPC_SMA_LENGTH']}d):          {cs_str}
+  CNN Fear & Greed:       {fg_str}/100
+  F&G SMA ({DAILY['FG_SMA_DAILY']}d):           {fg_d_str}/100
+  F&G SMA (10w):          {fg_w_str}/100
+{price_sections}
 
   BOTTOM conditions ({d['b_score']}/3, need 2)
     VIX SMA > {DAILY['VIX_FEAR']}:             {_chk(d['b_vix']):3s}  (VIX SMA = {_fmt(d['vix_sma'])})
     CPC SMA > {DAILY['CPC_FEAR']}:            {_chk(d['b_cpc']):3s}  (CPC SMA = {cs_str})
-    F&G < {DAILY['FG_BUY']} (extreme fear):    {_chk(d['b_fg']):3s}  (F&G = {fg_str})
+    F&G {DAILY['FG_SMA_DAILY']}d SMA < {DAILY['FG_BUY']}:       {_chk(d['b_fg']):3s}  (F&G SMA = {fg_d_str})
 
   TOP conditions ({d['t_score']}/3, need 2)
     CPC SMA < {DAILY['CPC_GREED']}:            {_chk(d['t_cpc']):3s}  (CPC SMA = {cs_str})
     VIX SMA < {DAILY['VIX_COMPLACENT']}:            {_chk(d['t_vix']):3s}  (VIX SMA = {_fmt(d['vix_sma'])})
-    F&G > {DAILY['FG_CAUTION']} (greed):           {_chk(d['t_fg']):3s}  (F&G = {fg_str})
+    F&G {DAILY['FG_SMA_DAILY']}d SMA > {DAILY['FG_CAUTION']}:       {_chk(d['t_fg']):3s}  (F&G SMA = {fg_d_str})
 
   {signal}
 ╚═══════════════════════════════════════════╝"""
@@ -310,51 +341,136 @@ def format_daily(d):
 
 # ── RUNNERS ───────────────────────────────────────────────────────────────────
 
+def _signal_label(b_score, t_score, b_min, t_min):
+    if b_score >= b_min:
+        return "BUY"
+    if t_score >= t_min:
+        return "SELL"
+    return "NEUTRAL"
+
+
 def run_daily():
     print("Fetching daily data...")
     d = compute_daily()
     if not d:
         print("ERROR: daily data unavailable.")
         return
-    twitter = build_twitter_block()
-    report  = format_daily(d) + twitter
+    prices = [compute_price(t) for t in TICKERS]
+    report = format_daily(d, prices)
     print(report)
-    _send_email(f"{TICKER} Daily Signals {d['date'].strftime('%Y-%m-%d')}", report)
+    tickers_str = " & ".join(TICKERS)
+    label = _signal_label(d["b_score"], d["t_score"], 2, 2)
+    _send_email(f"{tickers_str} Daily Signals {d['date'].strftime('%Y-%m-%d')} — {label}", report)
 
 
 def run_weekly():
     print("Fetching weekly data...")
-    w = compute_weekly()
-    if not w:
-        print("ERROR: weekly data unavailable.")
+    parts  = []
+    labels = []
+    for ticker in TICKERS:
+        w = compute_weekly(ticker)
+        if not w:
+            print(f"ERROR: weekly data unavailable for {ticker}.")
+            continue
+        parts.append(format_weekly(w, ticker))
+        labels.append(_signal_label(w["b_score"], w["t_score"], WEEKLY["MIN_BOTTOM"], WEEKLY["MIN_TOP"]))
+    if not parts:
         return
-    report = format_weekly(w)
+    report = "\n".join(parts)
     print(report)
-    _send_email(f"{TICKER} Weekly Signals {w['date'].strftime('%Y-%m-%d')}", report)
+    tickers_str = " & ".join(TICKERS)
+    label = "BUY" if "BUY" in labels else ("SELL" if "SELL" in labels else "NEUTRAL")
+    date_str = datetime.now(ET).strftime("%Y-%m-%d")
+    _send_email(f"{tickers_str} Weekly Signals {date_str} — {label}", report)
 
 
 def run_both():
     print("Fetching all data...")
     d = compute_daily()
-    w = compute_weekly()
-    if not d and not w:
+    weekly_parts = []
+    weekly_results = []
+    for ticker in TICKERS:
+        w = compute_weekly(ticker)
+        if w:
+            weekly_parts.append(format_weekly(w, ticker))
+            weekly_results.append(w)
+
+    if not d and not weekly_parts:
         print("ERROR: no data available.")
         return
 
-    twitter = build_twitter_block()
+    prices = [compute_price(t) for t in TICKERS]
     parts = [s for s in [
-        format_daily(d)  if d else None,
-        format_weekly(w) if w else None,
-        twitter          if twitter else None,
+        format_daily(d, prices) if d else None,
+        *weekly_parts,
     ] if s]
     report = "\n".join(parts)
 
     print(report)
     date_str = datetime.now(ET).strftime("%Y-%m-%d")
-    _send_email(f"{TICKER} Market Signals {date_str}", report)
+    tickers_str = " & ".join(TICKERS)
+    if d:
+        label = _signal_label(d["b_score"], d["t_score"], 2, 2)
+    else:
+        labels = [_signal_label(w["b_score"], w["t_score"], WEEKLY["MIN_BOTTOM"], WEEKLY["MIN_TOP"]) for w in weekly_results]
+        label = "BUY" if "BUY" in labels else ("SELL" if "SELL" in labels else "NEUTRAL")
+    _send_email(f"{tickers_str} Market Signals {date_str} — {label}", report)
 
 
 # ── EMAIL ─────────────────────────────────────────────────────────────────────
+
+def _to_html(text):
+    """Convert plain-text report to colored HTML email."""
+    import html as _html
+    GREEN  = "#2a9d2a"
+    RED    = "#cc2222"
+    GRAY   = "#888888"
+
+    in_bottom = False
+    in_top    = False
+    html_lines = []
+
+    for line in text.split("\n"):
+        esc = _html.escape(line)
+
+        # Track which condition block we're in
+        if "BOTTOM conditions" in line:
+            in_bottom, in_top = True, False
+        elif "TOP conditions" in line:
+            in_bottom, in_top = False, True
+        elif line.strip().startswith("→"):
+            in_bottom = in_top = False
+
+        # Color the signal line
+        if "→ BOTTOM WATCH" in esc:
+            esc = esc.replace("→ BOTTOM WATCH",
+                f'<span style="color:{GREEN};font-weight:bold">→ BOTTOM WATCH</span>')
+        elif "→ TOP WATCH" in esc:
+            esc = esc.replace("→ TOP WATCH",
+                f'<span style="color:{RED};font-weight:bold">→ TOP WATCH</span>')
+        elif "→ NEUTRAL" in esc:
+            esc = esc.replace("→ NEUTRAL",
+                f'<span style="color:{GRAY};font-weight:bold">→ NEUTRAL</span>')
+
+        # Color YES/No in condition rows
+        if re.search(r"\bYES\b", esc):
+            color = GREEN if in_bottom else (RED if in_top else GREEN)
+            esc = re.sub(r"\bYES\b",
+                f'<span style="color:{color};font-weight:bold">YES</span>', esc)
+        if re.search(r"\bNo\b", esc):
+            esc = re.sub(r"\bNo\b",
+                f'<span style="color:{GRAY}">No </span>', esc)
+
+        html_lines.append(esc)
+
+    body = "\n".join(html_lines)
+    return f"""<!DOCTYPE html>
+<html>
+<body style="background:#ffffff;margin:0;padding:20px;">
+<pre style="font-family:'Courier New',Courier,monospace;font-size:13px;color:#222222;line-height:1.5;white-space:pre;">{body}</pre>
+</body>
+</html>"""
+
 
 def _send_email(subject, body):
     to   = os.environ.get("EMAIL_TO",       "")
@@ -370,6 +486,7 @@ def _send_email(subject, body):
     msg = MIMEMultipart("alternative")
     msg["Subject"], msg["From"], msg["To"] = subject, frm, to
     msg.attach(MIMEText(body, "plain"))
+    msg.attach(MIMEText(_to_html(body), "html"))  # html last = preferred by clients
 
     try:
         with smtplib.SMTP(srv, port) as server:
@@ -407,19 +524,10 @@ def start_scheduler():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 
-def run_news():
-    block = build_twitter_block()
-    print(block or "No news available (is GEMINI_API_KEY set?)")
-    if block:
-        date_str = datetime.now(ET).strftime("%Y-%m-%d")
-        _send_email(f"{TICKER} Market News {date_str}", block)
-
-
 _COMMANDS = {
     "daily":    run_daily,
     "weekly":   run_weekly,
     "both":     run_both,
-    "news":     run_news,
     "schedule": start_scheduler,
 }
 

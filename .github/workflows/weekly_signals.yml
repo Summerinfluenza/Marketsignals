@@ -14,7 +14,6 @@ on:
           - both
           - daily
           - weekly
-          - news
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -29,9 +28,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
-        run: pip install google-genai
-
       - name: Run Market Signals
         env:
           EMAIL_TO:       ${{ secrets.EMAIL_TO }}
@@ -39,6 +35,5 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           SMTP_SERVER:    ${{ secrets.SMTP_SERVER }}
           SMTP_PORT:      ${{ secrets.SMTP_PORT }}
-          TICKER:         ${{ secrets.TICKER }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TICKERS:        ${{ secrets.TICKERS }}
         run: python market_signals.py ${{ github.event.inputs.mode || 'both' }}
