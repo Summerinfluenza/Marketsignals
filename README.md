@@ -1,6 +1,6 @@
-# Market Signals
+# Market Signals v17
 
-A lightweight Python script that emails you a daily pre-market report with technical signals — no paid services required.
+A lightweight Python script that emails you a daily pre-market report with statistical outlier signals — no paid services required.
 
 ---
 
@@ -8,17 +8,36 @@ A lightweight Python script that emails you a daily pre-market report with techn
 
 Every weekday at **9:00 AM ET** (30 minutes before US market open) you get an email with two sections:
 
-**Daily signals** — fast-moving sentiment indicators
-- VIX SMA (10-day)
-- Put/Call Ratio SMA (10-day)
-- CNN Fear & Greed Index
+**Daily signals** — statistical outlier model for short-term extremes
+- VXN Z-Score (Nasdaq-100 volatility vs 50-day baseline)
+- Put/Call Open Interest Ratio Z-Score (equity-only, scraped from ycharts.com)
+- Chaikin Money Flow (CMF) — institutional buying/selling pressure
+- Volume climax detection (200% of average)
+- 14-day RSI
+- 200-day SMA vs price
 
 **Weekly signals** — structural trend indicators
 - 200-week Moving Average vs price
 - 14-week RSI
-- % price is above the 200-week MA
+- % price above the 200-week MA
 
-Each indicator is scored YES/NO against a threshold. When enough conditions align, the report flags a **Bottom Watch** or **Top Watch** zone. The email subject line shows the current signal: **BUY**, **SELL**, or **NEUTRAL**.
+Each indicator is scored as a statistical condition. When enough conditions align, the report flags an **OUTLIER BUY**, **OUTLIER SELL**, or **NEUTRAL** signal.
+
+---
+
+## Signal Logic (Daily)
+
+| Condition | Bottom (Buy) | Top (Sell) |
+|---|---|---|
+| VXN Z-Score | \> +2.5 SD | — |
+| PCR Z-Score | \> +2.5 SD | — |
+| PCR raw | — | \< 0.70 (euphoria) |
+| Volume | — | \> 200% of avg (climax) |
+| CMF | — | \< 0 (distribution) |
+| RSI (14d) | \< 30 (oversold) | \> 80 (overbought) |
+
+**Bottom trigger**: ≥ 2 of 3 conditions met (VXN outlier, PCR outlier, oversold RSI).  
+**Top trigger**: ≥ 3 of 4 conditions met, and PCR euphoria floor is **required**.
 
 ---
 
@@ -48,12 +67,6 @@ Go to your fork → **Settings** → **Secrets and variables** → **Actions** �
 | `EMAIL_FROM` | Gmail address to send from |
 | `EMAIL_PASSWORD` | Gmail [App Password](https://myaccount.google.com/apppasswords) (not your login password) |
 
-Optional extras:
-
-| Secret | Value |
-|---|---|
-| `TICKERS` | Comma-separated tickers to track — default is `SPY,QQQ` |
-
 > **Gmail App Password**: go to myaccount.google.com/apppasswords, create one for "Mail", copy the 16-character code.
 
 ### 3. Create the workflow file
@@ -81,7 +94,6 @@ jobs:
           EMAIL_TO:       ${{ secrets.EMAIL_TO }}
           EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          TICKER:         ${{ secrets.TICKER }}
         run: python market_signals.py both
 ```
 
@@ -124,29 +136,41 @@ python market_signals.py schedule  # daemon: auto-fires at 9:00 AM ET on weekday
 
 ## Customisation
 
-All thresholds are at the top of `market_signals.py`:
+All thresholds are at the top of `market_signals.py` in the `OUTLIER`, `DAILY`, and `WEEKLY` config blocks:
 
 ```python
-WEEKLY = {
-    "RSI_OVERSOLD":   30,    # RSI below this → bottom condition
-    "RSI_OVERBOUGHT": 70,    # RSI above this → top condition
-    "PCT_ABOVE_MA":   40.0,  # % above 200w MA → top condition
+OUTLIER = {
+    "LOOKBACK":    50,    # 50-day window to determine "normal"
+    "THRESHOLD":   2.5,   # Standard Deviations (Z-Score)
+    "PCR_FLOOR":   0.70,  # Euphoria floor for tops (equity OI put/call)
+    "VOL_CLIMAX":  2.0,   # 200% of average volume
 }
 
 DAILY = {
-    "VIX_FEAR":          20,   # VIX SMA above → fear (bottom)
-    "VIX_COMPLACENT":    13,   # VIX SMA below → complacency (top)
-    "CPC_FEAR":          1.0,  # Put/Call above → fear (bottom)
-    "CPC_GREED":         0.8,  # Put/Call below → greed (top)
-    "FG_BUY":            25,   # CNN F&G below → extreme fear (bottom)
-    "FG_CAUTION":        70,   # CNN F&G above → greed (top)
+    "PRICE_SMA":    200,   # 200-day SMA
+    "PRICE_RSI":     14,   # 14-day RSI
+}
+
+WEEKLY = {
+    "MA_LENGTH":      200,   # 200-week simple MA
+    "RSI_LENGTH":     14,    # 14-week RSI
+    "RSI_OVERSOLD":   30,
+    "RSI_OVERBOUGHT": 70,
+    "PCT_ABOVE_MA":   40.0,  # % price above 200w MA → top condition
+    "MIN_BOTTOM":     2,
+    "MIN_TOP":        3,
 }
 ```
 
 ---
 
-## Dependencies
+## Data Sources
 
-No external packages required. stdlib only.
+| Indicator | Source |
+|---|---|
+| QQQ price, volume, OHLCV | Yahoo Finance (free, no API key) |
+| ^VXN (Nasdaq-100 volatility) | Yahoo Finance |
+| Equity Put/Call Open Interest Ratio | ycharts.com (scraped) |
+| CNN Fear & Greed Index | cnn.com (fetched, shown on demand) |
 
-Python 3.9+ required (uses `zoneinfo`).
+No API keys, no paid subscriptions, no external packages — stdlib only. Python 3.9+ required (uses `zoneinfo`).

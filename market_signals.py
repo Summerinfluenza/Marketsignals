@@ -1,8 +1,8 @@
 """
-Market Top & Bottom Signals v7
+Market Top & Bottom Signals v17 — Statistical Outlier Model
 Two report modes, both delivered daily at 9:00 AM ET (30 min before open):
 
-  DAILY  — VIX SMA, CPC SMA, Breadth (fast-moving sentiment)
+  DAILY  — Z-Score outliers (VXN + PCR), CMF money flow, volume climax
   WEEKLY — 200-week MA, 14-week RSI, % over MA (structural trend)
 
 Usage:
@@ -12,9 +12,12 @@ Usage:
   python market_signals.py schedule   # daemon: fires every weekday at 9:00 AM ET
 
 Environment variables:
-  TICKER                      — ticker to track (default: SPY)
   EMAIL_TO / EMAIL_FROM / EMAIL_PASSWORD
   SMTP_SERVER / SMTP_PORT     — default: smtp.gmail.com:587
+
+Tracks QQQ (Nasdaq-100 ETF). Uses ^VXN (Nasdaq-100 volatility index).
+IV Percentile is derived from ^VXN daily closes (Yahoo Finance).
+Equity Put/Call Open Interest Ratio is scraped from ycharts.com.
 """
 
 import os
@@ -25,6 +28,9 @@ import time
 import smtplib
 import urllib.request
 import urllib.parse
+import math
+import functools
+import statistics
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
@@ -32,9 +38,17 @@ from zoneinfo import ZoneInfo
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-_tickers_env = os.environ.get("TICKERS") or os.environ.get("TICKER", "SPY,QQQ")
-TICKERS = [t.strip().upper() for t in _tickers_env.split(",") if t.strip()]
-ET = ZoneInfo("America/New_York")
+TICKER = "QQQ"
+VXN    = "^VXN"
+ET     = ZoneInfo("America/New_York")
+
+# Statistical Outlier Parameters
+OUTLIER = {
+    "LOOKBACK":    50,    # 50-day window to determine "normal"
+    "THRESHOLD":   2.5,   # Standard Deviations (Z-Score)
+    "PCR_FLOOR":   0.70,  # Euphoria floor for tops (equity OI put/call)
+    "VOL_CLIMAX":  2.0,   # 200% of average volume
+}
 
 WEEKLY = {
     "MA_LENGTH":      200,   # 200-week simple MA
@@ -47,47 +61,83 @@ WEEKLY = {
 }
 
 DAILY = {
-    "VIX_SMA_LENGTH":    10,
+    "VXN_SMA_LENGTH":    10,
     "CPC_SMA_LENGTH":    10,
-    "VIX_FEAR":       20,    # VIX SMA above → fear (bottom signal)
-    "VIX_COMPLACENT": 13,    # VIX SMA below → complacency (top signal)
-    "CPC_FEAR":       1.0,   # CPC SMA above → fear (bottom signal)
-    "CPC_GREED":      0.8,   # CPC SMA below → greed (top signal)
-    "FG_SMA_DAILY":   10,    # 10-day SMA of F&G
-    "FG_SMA_WEEKLY":  50,    # 10-week SMA of F&G (≈50 trading days)
-    "FG_BUY":         25,    # CNN F&G SMA below → extreme fear (bottom signal)
-    "FG_CAUTION":     70,    # CNN F&G SMA above → greed (top signal)
-    # Note: breadth is already a component of the CNN F&G index
-    "PRICE_SMA":      200,   # 200-day SMA
-    "PRICE_RSI":      14,    # 14-day RSI
+    "IVP_WINDOW":        252,   # 1-year lookback for IV percentile (from ^VXN)
+    "PRICE_SMA":         200,   # 200-day SMA
+    "PRICE_RSI":         14,    # 14-day RSI
 }
+
+# ── RETRY HELPERS ──────────────────────────────────────────────────────────────
+
+def retry(max_attempts=3, backoff=2):
+    """Decorator: retry on exception with exponential backoff."""
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            last_err = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    last_err = e
+                    if attempt < max_attempts:
+                        wait = backoff ** attempt
+                        print(f"  Retry {attempt}/{max_attempts} for {fn.__name__} in {wait}s: {e}")
+                        time.sleep(wait)
+            raise last_err  # type: ignore
+        return wrapper
+    return decorator
+
 
 # ── DATA FETCHERS ─────────────────────────────────────────────────────────────
 
+@retry(max_attempts=3, backoff=2)
 def fetch_yahoo(symbol, days=None, weeks=None, interval="1d"):
-    """Fetch OHLC candles from Yahoo Finance. Returns [{date, close}, ...]."""
+    """
+    Fetch OHLCV candles from Yahoo Finance.
+    Returns [{date, open, high, low, close, volume}, ...].
+    """
     now = int(datetime.now().timestamp())
-    period1 = now - (weeks * 7 if weeks else days) * 86400
+    if weeks:
+        days_needed = weeks * 7
+    elif days:
+        days_needed = days
+    else:
+        days_needed = 365
+    period1 = now - days_needed * 86400
     url = (
         f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}"
         f"?period1={period1}&period2={now}&interval={interval}"
     )
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-        result = data["chart"]["result"][0]
-        ts     = result["timestamp"]
-        closes = result["indicators"]["quote"][0]["close"]
-        return [
-            {"date": datetime.fromtimestamp(ts[i]), "close": closes[i]}
-            for i in range(len(ts)) if closes[i] is not None
-        ]
-    except Exception as e:
-        print(f"Yahoo fetch error [{symbol}]: {e}")
-        return []
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode())
+    result = data["chart"]["result"][0]
+    ts     = result["timestamp"]
+    quotes = result["indicators"]["quote"][0]
+    opens  = quotes.get("open",  [None] * len(ts))
+    highs  = quotes.get("high",  [None] * len(ts))
+    lows   = quotes.get("low",   [None] * len(ts))
+    closes = quotes.get("close", [None] * len(ts))
+    vols   = quotes.get("volume",[None] * len(ts))
+    candles = []
+    for i in range(len(ts)):
+        if closes[i] is not None:
+            candles.append({
+                "date":   datetime.fromtimestamp(ts[i]),
+                "open":   opens[i]   if opens[i]   is not None else closes[i],
+                "high":   highs[i]   if highs[i]   is not None else closes[i],
+                "low":    lows[i]    if lows[i]    is not None else closes[i],
+                "close":  closes[i],
+                "volume": vols[i]    if vols[i]    is not None else 0,
+            })
+    if not candles:
+        raise RuntimeError(f"No valid candles for {symbol}")
+    return candles
 
 
+@retry(max_attempts=3, backoff=2)
 def fetch_cnn_fg():
     """
     Fetch CNN Fear & Greed Index historical scores (0–100), oldest→newest.
@@ -102,56 +152,110 @@ def fetch_cnn_fg():
         "Referer":         "https://edition.cnn.com/markets/fear-and-greed",
         "Origin":          "https://edition.cnn.com",
     })
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-        hist   = data["fear_and_greed_historical"]["data"]
-        scores = [float(p["y"]) for p in hist if p.get("y") is not None]
-        current = scores[-1] if scores else None
-        rating  = data["fear_and_greed"]["rating"]
-        print(f"CNN F&G: {current:.1f} ({rating}), {len(scores)} history points")
-        return scores
-    except Exception as e:
-        print(f"CNN F&G fetch error: {e}")
-        return []
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+    hist   = data["fear_and_greed_historical"]["data"]
+    scores = [float(p["y"]) for p in hist if p.get("y") is not None]
+    current = scores[-1] if scores else None
+    rating  = data["fear_and_greed"]["rating"]
+    print(f"CNN F&G: {current:.1f} ({rating}), {len(scores)} history points")
+    return scores
 
 
+@retry(max_attempts=3, backoff=3)
 def fetch_cpc(num=10):
-    """Scrape latest daily CPC values from ycharts (newest first)."""
-    url = "https://ycharts.com/indicators/total_putcall_ratio"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        print(f"CPC fetch error: {e}")
-        return []
-
-    rows = re.findall(
-        r'<tr[^>]*>\s*<td[^>]*>([A-Za-z]+ \d{1,2}, \d{4})</td>\s*<td[^>]*>([\d.]+)</td>\s*</tr>',
-        html
-    )
-    values = []
-    for _, v in rows:
+    """
+    Scrape latest daily Equity Put/Call Open Interest Ratio from ycharts.com.
+    Open interest reflects outstanding contracts (more stable than volume-based).
+    Equity-only excludes index options — most relevant for QQQ/Nasdaq stocks.
+    Tries OI endpoint first, falls back through volume and total put/call.
+    Uses multiple fallback regex patterns for robustness against page changes.
+    """
+    urls = [
+        "https://ycharts.com/indicators/cboe_equity_put_call_open_interest_ratio",
+        "https://ycharts.com/indicators/equity_putcall_open_interest_ratio",
+        "https://ycharts.com/indicators/equity_putcall_ratio",
+        "https://ycharts.com/indicators/cboe_equity_put_call_ratio",
+        "https://ycharts.com/indicators/total_putcall_ratio",
+    ]
+    html = None
+    used_url = None
+    for url in urls:
         try:
-            values.append(float(v))
-        except ValueError:
-            pass
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            })
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            used_url = url
+            break
+        except Exception:
+            continue
+    if html is None:
+        raise RuntimeError("Could not fetch Put/Call Ratio from any ycharts endpoint.")
 
+    values = []
+
+    # Pattern 1: <tr> with <td>date</td><td>value</td> structure
+    rows = re.findall(
+        r'<td[^>]*>\s*([A-Za-z]+ \d{1,2}, \d{4})\s*</td>\s*<td[^>]*>\s*([\d.]+)\s*</td>',
+        html, re.IGNORECASE
+    )
+    if rows:
+        for _, v in rows:
+            try:
+                values.append(float(v))
+            except ValueError:
+                pass
+
+    # Pattern 2: looser match for numbers near recognizable date strings
     if not values:
-        values = [
-            float(v)
-            for v in re.findall(r'20[0-9]{2}\s*</td>\s*<td[^>]*>\s*([\d.]+)', html)
-        ]
+        raw = re.findall(
+            r'(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}, \d{4})\s*</td>\s*<td[^>]*>\s*([\d.]+)',
+            html
+        )
+        for v in raw:
+            try:
+                values.append(float(v))
+            except ValueError:
+                pass
+
+    # Pattern 3: any <td> with a float after a four-digit year pattern
+    if not values:
+        raw2 = re.findall(r'20[0-9]{2}\s*</td>\s*<td[^>]*>\s*([\d.]+)', html)
+        for v in raw2:
+            try:
+                values.append(float(v))
+            except ValueError:
+                pass
 
     if values:
-        print(f"CPC: scraped {len(values)} values (latest: {values[0]:.3f})")
+        print(f"CPC (equity OI): scraped {len(values)} values from ycharts.com (latest: {values[0]:.3f})")
     else:
-        print("ERROR: Could not scrape CPC from ycharts.")
+        raise RuntimeError("Could not scrape Put/Call Ratio from ycharts.com — page structure may have changed.")
     return values[:num]
+
+
+def compute_iv_percentile(vxn_data, window_days=252):
+    """
+    Compute IV Percentile from ^VXN (Nasdaq-100 Volatility Index) daily closes.
+    ^VXN itself represents the implied volatility of Nasdaq-100 options.
+
+    IV Percentile = % of days in the lookback window where VXN closed
+    below today's closing level. High percentile = fear (IV elevated vs history).
+
+    Source: Yahoo Finance ^VXN data (fetched by fetch_yahoo).
+    Returns percentile (0-100) or None if insufficient data.
+    """
+    if len(vxn_data) < 21:  # need at least a month
+        return None
+    closes = [d["close"] for d in vxn_data]
+    today  = closes[-1]
+    window = closes[-window_days:] if len(closes) >= window_days else closes
+    below  = sum(1 for c in window if c < today)
+    percentile = (below / len(window)) * 100
+    return percentile
 
 
 # ── INDICATORS ────────────────────────────────────────────────────────────────
@@ -180,11 +284,38 @@ def rsi(closes, period):
     return out
 
 
+# ── STATISTICAL HELPERS ────────────────────────────────────────────────────────
+
+def get_z_score(current, history):
+    """Calculate how many standard deviations today is from the mean."""
+    if len(history) < 20:
+        return 0
+    mu = statistics.mean(history)
+    sigma = statistics.stdev(history)
+    return (current - mu) / sigma if sigma != 0 else 0
+
+
+def compute_cmf(candles, period=20):
+    """Manually calculate Chaikin Money Flow for the latest candle."""
+    if len(candles) < period:
+        return 0
+    mf_values = []
+    vol_values = []
+    for c in candles[-period:]:
+        denom = (c['high'] - c['low'])
+        mfm = ((c['close'] - c['low']) - (c['high'] - c['close'])) / denom if denom != 0 else 0
+        mf_values.append(mfm * c['volume'])
+        vol_values.append(c['volume'])
+
+    total_vol = sum(vol_values)
+    return sum(mf_values) / total_vol if total_vol != 0 else 0
+
+
 # ── SIGNAL COMPUTATION ────────────────────────────────────────────────────────
 
-def compute_weekly(ticker):
-    """Returns weekly indicator dict or None on error."""
-    data = fetch_yahoo(ticker, weeks=250, interval="1wk")
+def compute_weekly():
+    """Returns weekly indicator dict for QQQ or None on error."""
+    data = fetch_yahoo(TICKER, weeks=250, interval="1wk")
     if not data:
         return None
 
@@ -213,44 +344,69 @@ def compute_weekly(ticker):
 
 
 def compute_daily():
-    """Returns daily indicator dict or None on error."""
-    vix_raw = fetch_yahoo("^VIX", days=100, interval="1d")
-    cpc_raw = fetch_cpc(DAILY["CPC_SMA_LENGTH"])
-    fg_hist = fetch_cnn_fg()
+    """Returns outlier-based daily indicators using Z-scores and CMF."""
+    # Fetch extended history for statistical baselines
+    vxn_raw = fetch_yahoo(VXN, days=500, interval="1d")
+    # Fetch QQQ specifically for volume climax, CMF, and RSI
+    qqq_raw = fetch_yahoo(TICKER, days=100, interval="1d")
+    # Get a larger sample of CPC for Z-score calculation
+    cpc_hist = fetch_cpc(num=100)
 
-    if not vix_raw:
+    if not vxn_raw or not cpc_hist:
         return None
 
-    vix_closes = [d["close"] for d in vix_raw]
-    vs = sma(vix_closes, DAILY["VIX_SMA_LENGTH"])[-1]
-    cs = None
-    if len(cpc_raw) >= DAILY["CPC_SMA_LENGTH"]:
-        cs = sma(list(reversed(cpc_raw)), DAILY["CPC_SMA_LENGTH"])[-1]
+    # 1. Current Values
+    curr_vxn = vxn_raw[-1]["close"]
+    curr_cpc = cpc_hist[0]  # YCharts newest first
+    curr_rsi = rsi([d["close"] for d in qqq_raw], DAILY["PRICE_RSI"])[-1]
+    curr_vol = qqq_raw[-1].get("volume", 0)
 
-    fg     = fg_hist[-1] if fg_hist else None
-    fg_d   = sma(fg_hist, DAILY["FG_SMA_DAILY"])[-1]  if len(fg_hist) >= DAILY["FG_SMA_DAILY"]  else None
-    fg_w   = sma(fg_hist, DAILY["FG_SMA_WEEKLY"])[-1] if len(fg_hist) >= DAILY["FG_SMA_WEEKLY"] else None
+    # 2. Historical Baselines (last 50 days)
+    vxn_hist = [d["close"] for d in vxn_raw[-OUTLIER["LOOKBACK"]-1:-1]]
+    cpc_hist_closes = cpc_hist[1:OUTLIER["LOOKBACK"]+1]
+    vol_hist = [d.get("volume", 0) for d in qqq_raw[-OUTLIER["LOOKBACK"]-1:-1] if d.get("volume")]
 
-    b_vix = vs   is not None and vs   > DAILY["VIX_FEAR"]
-    b_cpc = cs   is not None and cs   > DAILY["CPC_FEAR"]
-    b_fg  = fg_d is not None and fg_d < DAILY["FG_BUY"]
-    t_cpc = cs   is not None and cs   < DAILY["CPC_GREED"]
-    t_vix = vs   is not None and vs   < DAILY["VIX_COMPLACENT"]
-    t_fg  = fg_d is not None and fg_d > DAILY["FG_CAUTION"]
+    # 3. Z-Scores (The Outlier Filter)
+    vxn_z = get_z_score(curr_vxn, vxn_hist)
+    cpc_z = get_z_score(curr_cpc, cpc_hist_closes)
+
+    # 4. Climax & Money Flow
+    cmf_val = compute_cmf(qqq_raw)
+    avg_vol = statistics.mean(vol_hist) if vol_hist else 1
+    is_vol_climax = curr_vol > (avg_vol * OUTLIER["VOL_CLIMAX"])
+
+    # 5. Signal Logic
+    # BOTTOM: Need VXN and PCR to BOTH be statistical outliers + Oversold RSI
+    b_vxn_outlier = vxn_z > OUTLIER["THRESHOLD"]
+    b_cpc_outlier = cpc_z > OUTLIER["THRESHOLD"]
+    b_rsi_oversold = curr_rsi < 30
+
+    # TOP: Need PCR Euphoria + Volume Climax + Negative Money Flow
+    t_pcr_euphoria = curr_cpc < OUTLIER["PCR_FLOOR"]
+    t_neg_flow = cmf_val < 0
+    t_rsi_overbought = curr_rsi > 80
+
+    b_score = sum([b_vxn_outlier, b_cpc_outlier, b_rsi_oversold])
+    t_score = sum([t_pcr_euphoria, is_vol_climax, t_neg_flow, t_rsi_overbought])
 
     return {
-        "date":    datetime.now(ET),
-        "vix_sma": vs, "cpc_sma": cs, "fg": fg, "fg_sma_d": fg_d, "fg_sma_w": fg_w,
-        "b_vix": b_vix, "b_cpc": b_cpc, "b_fg": b_fg,
-        "t_vix": t_vix, "t_cpc": t_cpc, "t_fg": t_fg,
-        "b_score": sum([b_vix, b_cpc, b_fg]),
-        "t_score": sum([t_vix, t_cpc, t_fg]),
+        "date":         datetime.now(ET),
+        "vxn_z":        vxn_z,
+        "cpc_z":        cpc_z,
+        "cpc_curr":     curr_cpc,
+        "cmf":          cmf_val,
+        "rsi":          curr_rsi,
+        "vol_climax":   is_vol_climax,
+        "b_score":      b_score,
+        "t_score":      t_score,
+        "b_trigger":    b_score >= 2,       # Requires at least 2 outlier conditions
+        "t_trigger":    t_score >= 3 and t_pcr_euphoria,  # Top strictly requires low PCR
     }
 
 
-def compute_price(ticker):
-    """Returns daily price, 200d SMA, % vs SMA, and 14d RSI for a ticker."""
-    data = fetch_yahoo(ticker, days=300, interval="1d")
+def compute_price():
+    """Returns daily price, 200d SMA, % vs SMA, and 14d RSI for QQQ."""
+    data = fetch_yahoo(TICKER, days=300, interval="1d")
     if not data:
         return None
     closes  = [d["close"] for d in data]
@@ -258,22 +414,39 @@ def compute_price(ticker):
     sma200  = sma(closes, DAILY["PRICE_SMA"])[-1]
     pct     = ((price - sma200) / sma200 * 100) if sma200 else None
     rsi14   = rsi(closes, DAILY["PRICE_RSI"])[-1]
-    return {"ticker": ticker, "price": price, "sma200": sma200, "pct": pct, "rsi": rsi14}
+    return {"ticker": TICKER, "price": price, "sma200": sma200, "pct": pct, "rsi": rsi14}
 
 
 # ── REPORT FORMATTING ─────────────────────────────────────────────────────────
 
-def _fmt(v, d=2): return f"{v:.{d}f}" if v is not None else "N/A"
-def _chk(v):      return "YES" if v else "No"
+def _fmt(v, d=2):
+    return f"{v:.{d}f}" if v is not None else "N/A"
+
+def _chk(v):
+    return "YES" if v else "No"
+
+def _ivp_label(ivp):
+    """Return a descriptive label for the IV percentile."""
+    if ivp is None:
+        return "N/A"
+    if ivp > 90:
+        return f"{_fmt(ivp,1)}% ← EXTREME FEAR"
+    if ivp > 70:
+        return f"{_fmt(ivp,1)}% ← High"
+    if ivp < 15:
+        return f"{_fmt(ivp,1)}% ← EXTREME COMPLACENCY"
+    if ivp < 30:
+        return f"{_fmt(ivp,1)}% ← Low"
+    return f"{_fmt(ivp,1)}%"
 
 
-def format_weekly(w, ticker):
+def format_weekly(w):
     b_zone = w["b_score"] >= WEEKLY["MIN_BOTTOM"]
     t_zone = w["t_score"] >= WEEKLY["MIN_TOP"]
     signal = "→ BOTTOM WATCH" if b_zone else ("→ TOP WATCH" if t_zone else "→ NEUTRAL")
     return f"""
 ╔═══════════════════════════════════════════╗
-║  WEEKLY SIGNALS — {ticker:<6}  {w['date'].strftime('%Y-%m-%d')}  ║
+║  WEEKLY SIGNALS — {TICKER:<6}  {w['date'].strftime('%Y-%m-%d')}  ║
 ╠═══════════════════════════════════════════╣
   Price:            {_fmt(w['price'])}
   200-Week MA:      {_fmt(w['ma'])}
@@ -292,22 +465,14 @@ def format_weekly(w, ticker):
 ╚═══════════════════════════════════════════╝"""
 
 
-def format_daily(d, prices=None):
-    b_zone = d["b_score"] >= 2
-    t_zone = d["t_score"] >= 2
-    signal = "→ BOTTOM WATCH" if b_zone else ("→ TOP WATCH" if t_zone else "→ NEUTRAL")
-    cs_str   = _fmt(d["cpc_sma"], 3) if d["cpc_sma"]   is not None else "N/A"
-    fg_str   = _fmt(d["fg"],    1)   if d["fg"]         is not None else "N/A"
-    fg_d_str = _fmt(d["fg_sma_d"],1) if d["fg_sma_d"]  is not None else "N/A"
-    fg_w_str = _fmt(d["fg_sma_w"],1) if d["fg_sma_w"]  is not None else "N/A"
-    label    = " & ".join(TICKERS)
+def format_daily(d, price_info=None):
+    signal = "→ OUTLIER BUY" if d["b_trigger"] else ("→ OUTLIER SELL" if d["t_trigger"] else "→ NEUTRAL")
 
-    price_sections = ""
-    for p in (prices or []):
-        if not p:
-            continue
-        pct_str = (f"+{p['pct']:.2f}%" if p["pct"] >= 0 else f"{p['pct']:.2f}%") if p["pct"] is not None else "N/A"
-        price_sections += f"""
+    price_section = ""
+    if price_info:
+        p = price_info
+        pct_str = (f"+{p['pct']:.2f}%" if p['pct'] >= 0 else f"{p['pct']:.2f}%") if p['pct'] is not None else "N/A"
+        price_section = f"""
   ── {p['ticker']} ──────────────────────────────
   Price:              {_fmt(p['price'])}
   200-Day SMA:        {_fmt(p['sma200'])}
@@ -316,24 +481,26 @@ def format_daily(d, prices=None):
 
     return f"""
 ╔═══════════════════════════════════════════╗
-║  DAILY SIGNALS — {label:<6}   {d['date'].strftime('%Y-%m-%d')}  ║
+║  STATISTICAL SIGNALS — QQQ    {d['date'].strftime('%Y-%m-%d')}  ║
 ╠═══════════════════════════════════════════╣
-  VIX SMA ({DAILY['VIX_SMA_LENGTH']}d):          {_fmt(d['vix_sma'])}
-  CPC SMA ({DAILY['CPC_SMA_LENGTH']}d):          {cs_str}
-  CNN Fear & Greed:       {fg_str}/100
-  F&G SMA ({DAILY['FG_SMA_DAILY']}d):           {fg_d_str}/100
-  F&G SMA (10w):          {fg_w_str}/100
-{price_sections}
+  VXN Z-Score:        {_fmt(d['vxn_z'])} SD
+  PCR Z-Score:        {_fmt(d['cpc_z'])} SD
+  PCR Current:        {_fmt(d['cpc_curr'], 3)}
+  Money Flow (CMF):   {_fmt(d['cmf'], 3)}
+  RSI (14d):          {_fmt(d['rsi'], 1)}
+  Volume Climax:      {_chk(d['vol_climax'])}
+{price_section}
 
-  BOTTOM conditions ({d['b_score']}/3, need 2)
-    VIX SMA > {DAILY['VIX_FEAR']}:             {_chk(d['b_vix']):3s}  (VIX SMA = {_fmt(d['vix_sma'])})
-    CPC SMA > {DAILY['CPC_FEAR']}:            {_chk(d['b_cpc']):3s}  (CPC SMA = {cs_str})
-    F&G {DAILY['FG_SMA_DAILY']}d SMA < {DAILY['FG_BUY']}:       {_chk(d['b_fg']):3s}  (F&G SMA = {fg_d_str})
+  BOTTOM CONDITIONS (Statistical Outliers — need 2 of 3)
+    VXN > +{OUTLIER['THRESHOLD']} SD:          {_chk(d['vxn_z'] > OUTLIER['THRESHOLD']):3s}
+    PCR > +{OUTLIER['THRESHOLD']} SD:          {_chk(d['cpc_z'] > OUTLIER['THRESHOLD']):3s}
+    RSI < 30:                 {_chk(d['rsi'] < 30):3s}
 
-  TOP conditions ({d['t_score']}/3, need 2)
-    CPC SMA < {DAILY['CPC_GREED']}:            {_chk(d['t_cpc']):3s}  (CPC SMA = {cs_str})
-    VIX SMA < {DAILY['VIX_COMPLACENT']}:            {_chk(d['t_vix']):3s}  (VIX SMA = {_fmt(d['vix_sma'])})
-    F&G {DAILY['FG_SMA_DAILY']}d SMA > {DAILY['FG_CAUTION']}:       {_chk(d['t_fg']):3s}  (F&G SMA = {fg_d_str})
+  TOP CONDITIONS (Euphoria & Distribution — need 3 of 4, requires PCR floor)
+    PCR < {OUTLIER['PCR_FLOOR']}:              {_chk(d['cpc_curr'] < OUTLIER['PCR_FLOOR']):3s}
+    Volume > 200% Avg:        {_chk(d['vol_climax']):3s}
+    Inst. Selling (CMF < 0):  {_chk(d['cmf'] < 0):3s}
+    RSI > 80:                 {_chk(d['rsi'] > 80):3s}
 
   {signal}
 ╚═══════════════════════════════════════════╝"""
@@ -355,66 +522,49 @@ def run_daily():
     if not d:
         print("ERROR: daily data unavailable.")
         return
-    prices = [compute_price(t) for t in TICKERS]
-    report = format_daily(d, prices)
+    price = compute_price()
+    report = format_daily(d, price)
     print(report)
-    tickers_str = " & ".join(TICKERS)
-    label = _signal_label(d["b_score"], d["t_score"], 2, 2)
-    _send_email(f"{tickers_str} Daily Signals {d['date'].strftime('%Y-%m-%d')} — {label}", report)
+    label = "BUY" if d["b_trigger"] else ("SELL" if d["t_trigger"] else "NEUTRAL")
+    _send_email(f"{TICKER} Daily Signals {d['date'].strftime('%Y-%m-%d')} — {label}", report)
 
 
 def run_weekly():
     print("Fetching weekly data...")
-    parts  = []
-    labels = []
-    for ticker in TICKERS:
-        w = compute_weekly(ticker)
-        if not w:
-            print(f"ERROR: weekly data unavailable for {ticker}.")
-            continue
-        parts.append(format_weekly(w, ticker))
-        labels.append(_signal_label(w["b_score"], w["t_score"], WEEKLY["MIN_BOTTOM"], WEEKLY["MIN_TOP"]))
-    if not parts:
+    w = compute_weekly()
+    if not w:
+        print("ERROR: weekly data unavailable.")
         return
-    report = "\n".join(parts)
+    report = format_weekly(w)
     print(report)
-    tickers_str = " & ".join(TICKERS)
-    label = "BUY" if "BUY" in labels else ("SELL" if "SELL" in labels else "NEUTRAL")
+    label = _signal_label(w["b_score"], w["t_score"], WEEKLY["MIN_BOTTOM"], WEEKLY["MIN_TOP"])
     date_str = datetime.now(ET).strftime("%Y-%m-%d")
-    _send_email(f"{tickers_str} Weekly Signals {date_str} — {label}", report)
+    _send_email(f"{TICKER} Weekly Signals {date_str} — {label}", report)
 
 
 def run_both():
     print("Fetching all data...")
     d = compute_daily()
-    weekly_parts = []
-    weekly_results = []
-    for ticker in TICKERS:
-        w = compute_weekly(ticker)
-        if w:
-            weekly_parts.append(format_weekly(w, ticker))
-            weekly_results.append(w)
+    w = compute_weekly()
 
-    if not d and not weekly_parts:
+    if not d and not w:
         print("ERROR: no data available.")
         return
 
-    prices = [compute_price(t) for t in TICKERS]
+    price = compute_price()
     parts = [s for s in [
-        format_daily(d, prices) if d else None,
-        *weekly_parts,
+        format_daily(d, price) if d else None,
+        format_weekly(w) if w else None,
     ] if s]
     report = "\n".join(parts)
 
     print(report)
     date_str = datetime.now(ET).strftime("%Y-%m-%d")
-    tickers_str = " & ".join(TICKERS)
     if d:
-        label = _signal_label(d["b_score"], d["t_score"], 2, 2)
+        label = "BUY" if d["b_trigger"] else ("SELL" if d["t_trigger"] else "NEUTRAL")
     else:
-        labels = [_signal_label(w["b_score"], w["t_score"], WEEKLY["MIN_BOTTOM"], WEEKLY["MIN_TOP"]) for w in weekly_results]
-        label = "BUY" if "BUY" in labels else ("SELL" if "SELL" in labels else "NEUTRAL")
-    _send_email(f"{tickers_str} Market Signals {date_str} — {label}", report)
+        label = _signal_label(w["b_score"], w["t_score"], WEEKLY["MIN_BOTTOM"], WEEKLY["MIN_TOP"]) if w else "NEUTRAL"
+    _send_email(f"{TICKER} Market Signals {date_str} — {label}", report)
 
 
 # ── EMAIL ─────────────────────────────────────────────────────────────────────
@@ -424,25 +574,41 @@ def _to_html(text):
     import html as _html
     GREEN  = "#2a9d2a"
     RED    = "#cc2222"
+    ORANGE = "#e67e00"
     GRAY   = "#888888"
 
     in_bottom = False
     in_top    = False
+    in_extreme = False
     html_lines = []
 
     for line in text.split("\n"):
         esc = _html.escape(line)
 
         # Track which condition block we're in
-        if "BOTTOM conditions" in line:
-            in_bottom, in_top = True, False
-        elif "TOP conditions" in line:
-            in_bottom, in_top = False, True
-        elif line.strip().startswith("→"):
-            in_bottom = in_top = False
+        if "BOTTOM CONDITIONS" in line:
+            in_bottom, in_top, in_extreme = True, False, False
+        elif "TOP CONDITIONS" in line:
+            in_bottom, in_top, in_extreme = False, True, False
+        elif "EXTREME thresholds" in line:
+            in_bottom, in_top, in_extreme = False, False, True
+        elif line.strip().startswith("→") or line.strip().startswith("╚"):
+            in_bottom = in_top = in_extreme = False
+
+        # Color extreme warning lines
+        if "EXTREME FEAR" in esc:
+            esc = f'<span style="color:{RED};font-weight:bold">{esc}</span>'
+        elif "EXTREME COMPLACENCY" in esc:
+            esc = f'<span style="color:{ORANGE};font-weight:bold">{esc}</span>'
 
         # Color the signal line
-        if "→ BOTTOM WATCH" in esc:
+        if "→ OUTLIER BUY" in esc:
+            esc = esc.replace("→ OUTLIER BUY",
+                f'<span style="color:{GREEN};font-weight:bold">→ OUTLIER BUY</span>')
+        elif "→ OUTLIER SELL" in esc:
+            esc = esc.replace("→ OUTLIER SELL",
+                f'<span style="color:{RED};font-weight:bold">→ OUTLIER SELL</span>')
+        elif "→ BOTTOM WATCH" in esc:
             esc = esc.replace("→ BOTTOM WATCH",
                 f'<span style="color:{GREEN};font-weight:bold">→ BOTTOM WATCH</span>')
         elif "→ TOP WATCH" in esc:
@@ -454,7 +620,14 @@ def _to_html(text):
 
         # Color YES/No in condition rows
         if re.search(r"\bYES\b", esc):
-            color = GREEN if in_bottom else (RED if in_top else GREEN)
+            if in_extreme:
+                color = ORANGE
+            elif in_bottom:
+                color = GREEN
+            elif in_top:
+                color = RED
+            else:
+                color = GREEN
             esc = re.sub(r"\bYES\b",
                 f'<span style="color:{color};font-weight:bold">YES</span>', esc)
         if re.search(r"\bNo\b", esc):
