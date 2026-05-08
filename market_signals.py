@@ -344,22 +344,33 @@ def compute_weekly():
 
 
 def compute_daily():
-    """Returns outlier-based daily indicators using Z-scores and CMF."""
+    """
+    Returns outlier-based daily indicators using Z-scores and CMF.
+    Matches Pine Script v17 exactly:
+      Bottom: VXN outlier AND PCR outlier AND RSI < 30 (all 3 required)
+      Top: 20d high AND volume climax AND CMF < 0 AND PCR < floor (all 4)
+    """
     # Fetch extended history for statistical baselines
     vxn_raw = fetch_yahoo(VXN, days=500, interval="1d")
-    # Fetch QQQ specifically for volume climax, CMF, and RSI
+    # Fetch QQQ specifically for volume climax, CMF, RSI, and 20-day high
     qqq_raw = fetch_yahoo(TICKER, days=100, interval="1d")
     # Get a larger sample of CPC for Z-score calculation
     cpc_hist = fetch_cpc(num=100)
 
-    if not vxn_raw or not cpc_hist:
+    if not vxn_raw or not cpc_hist or not qqq_raw:
         return None
 
+    qqq_closes = [d["close"] for d in qqq_raw]
+
     # 1. Current Values
-    curr_vxn = vxn_raw[-1]["close"]
-    curr_cpc = cpc_hist[0]  # YCharts newest first
-    curr_rsi = rsi([d["close"] for d in qqq_raw], DAILY["PRICE_RSI"])[-1]
-    curr_vol = qqq_raw[-1].get("volume", 0)
+    curr_vxn     = vxn_raw[-1]["close"]
+    curr_cpc     = cpc_hist[0]   # YCharts newest first
+    curr_rsi     = rsi(qqq_closes, DAILY["PRICE_RSI"])[-1]
+    curr_vol     = qqq_raw[-1].get("volume", 0)
+    curr_close   = qqq_closes[-1]
+    # 20-day high: ta.highest(close, 20) == close
+    highest_20   = max(qqq_closes[-20:]) if len(qqq_closes) >= 20 else curr_close
+    is_20d_high  = math.isclose(curr_close, highest_20, rel_tol=1e-9) or curr_close >= highest_20
 
     # 2. Historical Baselines (last 50 days)
     vxn_hist = [d["close"] for d in vxn_raw[-OUTLIER["LOOKBACK"]-1:-1]]
@@ -375,32 +386,42 @@ def compute_daily():
     avg_vol = statistics.mean(vol_hist) if vol_hist else 1
     is_vol_climax = curr_vol > (avg_vol * OUTLIER["VOL_CLIMAX"])
 
-    # 5. Signal Logic
-    # BOTTOM: Need VXN and PCR to BOTH be statistical outliers + Oversold RSI
-    b_vxn_outlier = vxn_z > OUTLIER["THRESHOLD"]
-    b_cpc_outlier = cpc_z > OUTLIER["THRESHOLD"]
-    b_rsi_oversold = curr_rsi < 30
+    # 5. Signal Logic — matched to Pine Script v17
+    vxn_outlier    = vxn_z > OUTLIER["THRESHOLD"]
+    pcr_outlier    = cpc_z > OUTLIER["THRESHOLD"]
+    rsi_oversold   = curr_rsi < 30
 
-    # TOP: Need PCR Euphoria + Volume Climax + Negative Money Flow
-    t_pcr_euphoria = curr_cpc < OUTLIER["PCR_FLOOR"]
-    t_neg_flow = cmf_val < 0
-    t_rsi_overbought = curr_rsi > 80
+    pcr_euphoria   = curr_cpc < OUTLIER["PCR_FLOOR"]
+    neg_flow       = cmf_val < 0
+    rsi_overbought = curr_rsi > 80
 
-    b_score = sum([b_vxn_outlier, b_cpc_outlier, b_rsi_oversold])
-    t_score = sum([t_pcr_euphoria, is_vol_climax, t_neg_flow, t_rsi_overbought])
+    # Bottom: ALL 3 required (vix_is_outlier AND pcr_is_outlier AND rsi < 30)
+    b_score   = sum([vxn_outlier, pcr_outlier, rsi_oversold])
+    b_trigger = vxn_outlier and pcr_outlier and rsi_oversold
+
+    # Top: ALL 4 required (20d high AND vol_climax AND CMF < 0 AND pcr < floor)
+    t_score   = sum([is_20d_high, is_vol_climax, neg_flow, pcr_euphoria])
+    t_trigger = is_20d_high and is_vol_climax and neg_flow and pcr_euphoria
 
     return {
-        "date":         datetime.now(ET),
-        "vxn_z":        vxn_z,
-        "cpc_z":        cpc_z,
-        "cpc_curr":     curr_cpc,
-        "cmf":          cmf_val,
-        "rsi":          curr_rsi,
-        "vol_climax":   is_vol_climax,
-        "b_score":      b_score,
-        "t_score":      t_score,
-        "b_trigger":    b_score >= 2,       # Requires at least 2 outlier conditions
-        "t_trigger":    t_score >= 3 and t_pcr_euphoria,  # Top strictly requires low PCR
+        "date":           datetime.now(ET),
+        "vxn_z":          vxn_z,
+        "cpc_z":          cpc_z,
+        "cpc_curr":       curr_cpc,
+        "cmf":            cmf_val,
+        "rsi":            curr_rsi,
+        "vol_climax":     is_vol_climax,
+        "is_20d_high":    is_20d_high,
+        "vxn_outlier":    vxn_outlier,
+        "pcr_outlier":    pcr_outlier,
+        "rsi_oversold":   rsi_oversold,
+        "pcr_euphoria":   pcr_euphoria,
+        "neg_flow":       neg_flow,
+        "rsi_overbought": rsi_overbought,
+        "b_score":        b_score,
+        "t_score":        t_score,
+        "b_trigger":      b_trigger,
+        "t_trigger":      t_trigger,
     }
 
 
@@ -479,7 +500,38 @@ def format_daily(d, price_info=None):
   % vs 200d SMA:      {pct_str}
   RSI (14d):          {_fmt(p['rsi'], 1)}"""
 
-    return f"""
+    # Determine which fields exist for display
+    has_new_fields = "is_20d_high" in d
+
+    if has_new_fields:
+        return f"""
+╔═══════════════════════════════════════════╗
+║  STATISTICAL SIGNALS — QQQ    {d['date'].strftime('%Y-%m-%d')}  ║
+╠═══════════════════════════════════════════╣
+  VXN Z-Score:        {_fmt(d['vxn_z'])} SD
+  PCR Z-Score:        {_fmt(d['cpc_z'])} SD
+  PCR Current:        {_fmt(d['cpc_curr'], 3)}
+  Money Flow (CMF):   {_fmt(d['cmf'], 3)}
+  RSI (14d):          {_fmt(d['rsi'], 1)}
+  Volume Climax:      {_chk(d['vol_climax'])}
+  20-Day High:         {_chk(d.get('is_20d_high', False))}
+{price_section}
+
+  BOTTOM CONDITIONS (all 3 required — Pine Script v17 match)
+    VXN > +{OUTLIER['THRESHOLD']} SD:          {_chk(d.get('vxn_outlier', False)):3s}   (Z={_fmt(d['vxn_z'])})
+    PCR > +{OUTLIER['THRESHOLD']} SD:          {_chk(d.get('pcr_outlier', False)):3s}   (Z={_fmt(d['cpc_z'])})
+    RSI < 30:                 {_chk(d.get('rsi_oversold', False)):3s}   (RSI={_fmt(d['rsi'], 1)})
+
+  TOP CONDITIONS (all 4 required — Pine Script v17 match)
+    PCR < {OUTLIER['PCR_FLOOR']}:              {_chk(d.get('pcr_euphoria', False)):3s}   ({_fmt(d['cpc_curr'], 3)})
+    Volume > 200% Avg:        {_chk(d['vol_climax']):3s}
+    Inst. Selling (CMF < 0):  {_chk(d.get('neg_flow', False)):3s}   (CMF={_fmt(d['cmf'], 3)})
+    20-Day High:               {_chk(d.get('is_20d_high', False)):3s}
+
+  {signal}
+╚═══════════════════════════════════════════╝"""
+    else:
+        return f"""
 ╔═══════════════════════════════════════════╗
 ║  STATISTICAL SIGNALS — QQQ    {d['date'].strftime('%Y-%m-%d')}  ║
 ╠═══════════════════════════════════════════╣
